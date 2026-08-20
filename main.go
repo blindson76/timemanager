@@ -604,6 +604,30 @@ func waitForBootstrapQuorum(members []ClusterMember, localRaftAddr string, expec
 
 }
 
+func bootstrapCluster(r *raft.Raft, servers []raft.Server) error {
+
+	err := r.BootstrapCluster(raft.Configuration{Servers: servers}).Error()
+
+	if err == nil {
+
+		log.Printf("[Bootstrap] cluster initialized")
+
+		return nil
+
+	}
+
+	if strings.Contains(err.Error(), "bootstrap only works on new clusters") {
+
+		log.Printf("[Bootstrap] cluster already initialized by another node")
+
+		return nil
+
+	}
+
+	return err
+
+}
+
 func main() {
 
 	appConfig, err := parseAppConfig(os.Args[1:])
@@ -679,9 +703,7 @@ func main() {
 
 	waitForBootstrapQuorum(appConfig.ClusterMembers, raftAddr, appConfig.BootstrapExpected, appConfig.BootstrapDelay)
 
-	bootstrapFuture := r.BootstrapCluster(raft.Configuration{Servers: raftServers})
-
-	if err := bootstrapFuture.Error(); err != nil {
+	if err := bootstrapCluster(r, raftServers); err != nil {
 
 		log.Fatalf("Kume baslatilamadi: %v", err)
 
