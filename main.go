@@ -258,6 +258,10 @@ type AppConfig struct {
 
 	HTTPPort string
 
+	BootstrapExpected int
+
+	BootstrapDelay time.Duration
+
 	ClusterMembers []ClusterMember
 }
 
@@ -265,13 +269,13 @@ var nodeRegistry map[string]string
 
 func usage() string {
 
-	return "Kullanım: go run main.go --node-name node-1 --raft-port 5001 --http-port 8001 --cluster-members 127.0.0.1:5001 127.0.0.1:5002 127.0.0.1:5003"
+	return "Usage: go run main.go --node-name node-1 --raft-port 5001 --http-port 8001 --bootstrap-expected 3 --bootstrap-delay 5s --cluster-members 127.0.0.1:5001 127.0.0.1:5002 127.0.0.1:5003"
 
 }
 
 func parseAppConfig(args []string) (AppConfig, error) {
 
-	cfg := AppConfig{}
+	cfg := AppConfig{BootstrapDelay: 5 * time.Second}
 
 	for i := 0; i < len(args); i++ {
 
@@ -312,6 +316,46 @@ func parseAppConfig(args []string) (AppConfig, error) {
 			}
 
 			cfg.HTTPPort = args[i]
+
+		case "--bootstrap-expected", "-bootstrap-expected":
+
+			i++
+
+			if i >= len(args) {
+
+				return cfg, fmt.Errorf("%s deÄŸeri eksik", args[i-1])
+
+			}
+
+			expected, err := strconv.Atoi(args[i])
+
+			if err != nil {
+
+				return cfg, fmt.Errorf("gecersiz bootstrap expected %q: %w", args[i], err)
+
+			}
+
+			cfg.BootstrapExpected = expected
+
+		case "--bootstrap-delay", "-bootstrap-delay", "--bootstrap-time", "-bootstrap-time":
+
+			i++
+
+			if i >= len(args) {
+
+				return cfg, fmt.Errorf("%s deÄŸeri eksik", args[i-1])
+
+			}
+
+			delay, err := time.ParseDuration(args[i])
+
+			if err != nil {
+
+				return cfg, fmt.Errorf("gecersiz bootstrap delay %q: %w", args[i], err)
+
+			}
+
+			cfg.BootstrapDelay = delay
 
 		case "--cluster-members", "-cluster-members":
 
@@ -361,6 +405,24 @@ func parseAppConfig(args []string) (AppConfig, error) {
 	if cfg.NodeID == "" || cfg.RaftPort == "" || cfg.HTTPPort == "" || len(cfg.ClusterMembers) == 0 {
 
 		return cfg, fmt.Errorf("eksik argüman")
+
+	}
+
+	if cfg.BootstrapExpected == 0 {
+
+		cfg.BootstrapExpected = len(cfg.ClusterMembers)
+
+	}
+
+	if cfg.BootstrapExpected < 1 || cfg.BootstrapExpected > len(cfg.ClusterMembers) {
+
+		return cfg, fmt.Errorf("bootstrap expected %d, 1 ile cluster member sayisi %d arasinda olmali", cfg.BootstrapExpected, len(cfg.ClusterMembers))
+
+	}
+
+	if cfg.BootstrapDelay < 0 {
+
+		return cfg, fmt.Errorf("bootstrap delay negatif olamaz")
 
 	}
 
@@ -458,6 +520,90 @@ func buildHTTPRegistry(members []ClusterMember, raftPort, httpPort string) (map[
 
 }
 
+func raftAddrForNode(members []ClusterMember, nodeID string) (string, bool) {
+
+	for _, member := range members {
+
+		if member.NodeID == nodeID {
+
+			return member.RaftAddr, true
+
+		}
+
+	}
+
+	return "", false
+
+}
+
+func countAvailableMembers(members []ClusterMember, localRaftAddr string, timeout time.Duration) int {
+
+	available := 0
+
+	for _, member := range members {
+
+		if member.RaftAddr == localRaftAddr {
+
+			available++
+
+			continue
+
+		}
+
+		conn, err := net.DialTimeout("tcp", member.RaftAddr, timeout)
+
+		if err != nil {
+
+			continue
+
+		}
+
+		conn.Close()
+
+		available++
+
+	}
+
+	return available
+
+}
+
+func waitForBootstrapQuorum(members []ClusterMember, localRaftAddr string, expected int, delay time.Duration) {
+
+	for {
+
+		available := countAvailableMembers(members, localRaftAddr, 500*time.Millisecond)
+
+		if available < expected {
+
+			log.Printf("[Bootstrap] %d/%d node reachable; waiting for bootstrap expected %d", available, len(members), expected)
+
+			time.Sleep(time.Second)
+
+			continue
+
+		}
+
+		log.Printf("[Bootstrap] bootstrap expected reached: %d/%d node reachable; waiting %s before bootstrapping", available, len(members), delay)
+
+		time.Sleep(delay)
+
+		available = countAvailableMembers(members, localRaftAddr, 500*time.Millisecond)
+
+		if available >= expected {
+
+			log.Printf("[Bootstrap] bootstrap delay completed with %d/%d node reachable", available, len(members))
+
+			return
+
+		}
+
+		log.Printf("[Bootstrap] node availability dropped to %d/%d during bootstrap delay; waiting again", available, len(members))
+
+	}
+
+}
+
 func main() {
 
 	appConfig, err := parseAppConfig(os.Args[1:])
@@ -482,7 +628,13 @@ func main() {
 
 	}
 
-	raftAddr := fmt.Sprintf("127.0.0.1:%s", raftPort)
+	raftAddr, ok := raftAddrForNode(appConfig.ClusterMembers, nodeID)
+
+	if !ok {
+
+		log.Fatalf("Node adresi bulunamadÄ±: %s", nodeID)
+
+	}
 
 	config := raft.DefaultConfig()
 
@@ -525,24 +677,17 @@ func main() {
 
 	}
 
-	if appConfig.ClusterMembers[0].NodeID == nodeID {
+	waitForBootstrapQuorum(appConfig.ClusterMembers, raftAddr, appConfig.BootstrapExpected, appConfig.BootstrapDelay)
 
-		bootstrapFuture := r.BootstrapCluster(raft.Configuration{Servers: raftServers})
+	bootstrapFuture := r.BootstrapCluster(raft.Configuration{Servers: raftServers})
 
-		if err := bootstrapFuture.Error(); err != nil {
+	if err := bootstrapFuture.Error(); err != nil {
 
-			log.Fatalf("Küme başlatılamadı: %v", err)
-
-		}
-
-		fmt.Printf("🚀 Küme yapılandırıldı: %+v\n", raftServers)
-
-	} else {
-
-		fmt.Printf("⏳ Küme üyesi olarak başlatıldı: %s (%s)\n", nodeID, raftAddr)
+		log.Fatalf("Kume baslatilamadi: %v", err)
 
 	}
 
+	fmt.Printf("Kume otomatik yapilandirildi: %+v\n", raftServers)
 	forwardToLeader := func(w http.ResponseWriter, req *http.Request, bodyBytes []byte) bool {
 
 		if r.State() == raft.Leader {
