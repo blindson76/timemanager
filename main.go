@@ -1,44 +1,38 @@
 package main
 
- 
-
 import (
+	"bufio"
 
-    "bufio"
+	"bytes"
 
-    "bytes"
+	"context"
 
-    "context"
+	"encoding/json"
 
-    "encoding/json"
+	"fmt"
 
-    "fmt"
+	"io"
 
-    "io"
+	"log"
 
-    "log"
+	"net"
 
-    "net/http"
+	"net/http"
 
-    "os"
+	"os"
 
-    "strconv"
+	"strconv"
 
-    "strings"
+	"strings"
 
-    "sync"
+	"sync"
 
-    "time"
+	"time"
 
- 
+	"github.com/floodfx/gstate"
 
-    "github.com/floodfx/gstate"
-
-    "github.com/hashicorp/raft"
-
+	"github.com/hashicorp/raft"
 )
-
- 
 
 // Tip tanımlamaları ve modeller öncekiyle aynı
 
@@ -46,616 +40,721 @@ type SystemState string
 
 type SystemEvent string
 
- 
-
 const (
+	StateProcessing SystemState = "Processing"
 
-    StateProcessing SystemState = "Processing"
+	StateCollecting SystemState = "Collecting"
 
-    StateCollecting SystemState = "Collecting"
+	StateWindowing SystemState = "Windowing"
 
-    StateWindowing  SystemState = "Windowing"
+	StateDone SystemState = "Done"
 
-    StateDone       SystemState = "Done"
-
-    EventReport     SystemEvent = "Report"
-
+	EventReport SystemEvent = "Report"
 )
 
- 
-
 type SystemStatus struct {
-
-    Reports []string `json:"reports"`
-
+	Reports []string `json:"reports"`
 }
-
- 
 
 func (s SystemStatus) Clone() SystemStatus {
 
-    reports := make([]string, len(s.Reports))
+	reports := make([]string, len(s.Reports))
 
-    copy(reports, s.Reports)
+	copy(reports, s.Reports)
 
-    return SystemStatus{Reports: reports}
+	return SystemStatus{Reports: reports}
 
 }
-
- 
 
 type CommandType string
 
- 
-
 const CommandSendReport CommandType = "SendReport"
 
- 
-
 type LogCommand struct {
+	Op CommandType `json:"op"`
 
-    Op    CommandType `json:"op"`
-
-    Value string      `json:"value"`
-
+	Value string `json:"value"`
 }
-
- 
 
 // FSM Tanımı
 
 type GStateFSM struct {
+	mu sync.Mutex
 
-    mu            sync.Mutex
+	machine *gstate.Machine[SystemState, SystemEvent, SystemStatus]
 
-    machine       *gstate.Machine[SystemState, SystemEvent, SystemStatus]
+	actor *gstate.Actor[SystemState, SystemEvent, SystemStatus]
 
-    actor         *gstate.Actor[SystemState, SystemEvent, SystemStatus]
-
-    pendingReport string
-
+	pendingReport string
 }
-
- 
 
 func NewGStateFSM() *GStateFSM {
 
-    fsm := &GStateFSM{}
+	fsm := &GStateFSM{}
 
-    builder := gstate.New[SystemState, SystemEvent, SystemStatus]("distributed-test").
+	builder := gstate.New[SystemState, SystemEvent, SystemStatus]("distributed-test").
+		Initial(StateProcessing).
+		State(StateProcessing, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
 
-        Initial(StateProcessing).
+			sb.Initial(StateCollecting)
 
-        State(StateProcessing, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
+			sb.On(EventReport).Assign(func(ss SystemStatus) SystemStatus {
 
-            sb.Initial(StateCollecting)
+				if fsm.pendingReport != "" {
 
-            sb.On(EventReport).Assign(func(ss SystemStatus) SystemStatus {
+					ss.Reports = append(ss.Reports, fsm.pendingReport)
 
-                if fsm.pendingReport != "" {
+					fmt.Printf("📝 [gstate Assign] Rapor eklendi: %s\n", fsm.pendingReport)
 
-                    ss.Reports = append(ss.Reports, fsm.pendingReport)
+					fsm.pendingReport = ""
 
-                    fmt.Printf("📝 [gstate Assign] Rapor eklendi: %s\n", fsm.pendingReport)
+				}
 
-                    fsm.pendingReport = ""
+				return ss
 
-                }
+			})
 
-                return ss
+			sb.State(StateCollecting, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
 
-            })
+				sb.Always().Guard(func(ss SystemStatus) bool { return len(ss.Reports) >= 3 }).GoTo(StateWindowing)
 
-            sb.State(StateCollecting, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
+			})
 
-                sb.Always().Guard(func(ss SystemStatus) bool { return len(ss.Reports) >= 3 }).GoTo(StateWindowing)
+			sb.State(StateWindowing, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
 
-            })
+				sb.After(5 * time.Second).GoTo(StateDone)
 
-            sb.State(StateWindowing, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
+			})
 
-                sb.After(5 * time.Second).GoTo(StateDone)
+			sb.Always().Guard(func(ss SystemStatus) bool { return len(ss.Reports) >= 6 }).GoTo(StateDone)
 
-            })
+		}).
+		State(StateDone, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
 
-            sb.Always().Guard(func(ss SystemStatus) bool { return len(ss.Reports) >= 6 }).GoTo(StateDone)
+			sb.Type(gstate.Final)
 
-        }).
+			sb.Entry(func(ss SystemStatus) SystemStatus {
 
-        State(StateDone, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
+				fmt.Printf("\n🎉 [FSM] Final duruma ulaşıldı: %+v\n", ss)
 
-            sb.Type(gstate.Final)
+				return ss
 
-            sb.Entry(func(ss SystemStatus) SystemStatus {
+			})
 
-                fmt.Printf("\n🎉 [FSM] Final duruma ulaşıldı: %+v\n", ss)
+		})
 
-                return ss
+	fsm.machine = builder.Build()
 
-            })
+	fsm.actor = gstate.Start(fsm.machine, SystemStatus{}, fsm.machine.WithObservers(&loggingObs{}))
 
-        })
-
- 
-
-    fsm.machine = builder.Build()
-
-    fsm.actor = gstate.Start(fsm.machine, SystemStatus{}, fsm.machine.WithObservers(&loggingObs{}))
-
-    return fsm
+	return fsm
 
 }
-
- 
 
 type loggingObs struct {
-
-    gstate.BaseObserver[SystemState, SystemEvent, SystemStatus]
-
+	gstate.BaseObserver[SystemState, SystemEvent, SystemStatus]
 }
-
- 
 
 func (l *loggingObs) OnTransition(ctx context.Context, e *gstate.TransitionEvent[SystemState, SystemEvent, SystemStatus]) {
 
-    log.Printf("🔄 [%s] %s --%s--> %s | %+v", e.ActorID, e.From, e.Event, e.To, e.Data().Reports)
+	log.Printf("🔄 [%s] %s --%s--> %s | %+v", e.ActorID, e.From, e.Event, e.To, e.Data().Reports)
 
 }
-
- 
 
 func (f *GStateFSM) Apply(l *raft.Log) interface{} {
 
-    f.mu.Lock()
+	f.mu.Lock()
 
-    defer f.mu.Unlock()
+	defer f.mu.Unlock()
 
-    var cmd LogCommand
+	var cmd LogCommand
 
-    if err := json.Unmarshal(l.Data, &cmd); err != nil {
+	if err := json.Unmarshal(l.Data, &cmd); err != nil {
 
-        return err
+		return err
 
-    }
+	}
 
-    if cmd.Op == CommandSendReport {
+	if cmd.Op == CommandSendReport {
 
-        f.pendingReport = cmd.Value
+		f.pendingReport = cmd.Value
 
-        f.actor.Send(EventReport)
+		f.actor.Send(EventReport)
 
-    }
+	}
 
-    return nil
+	return nil
 
 }
-
- 
 
 func (f *GStateFSM) Snapshot() (raft.FSMSnapshot, error) {
 
-    f.mu.Lock()
+	f.mu.Lock()
 
-    defer f.mu.Unlock()
+	defer f.mu.Unlock()
 
-    data, _ := json.Marshal(f.actor.Snapshot())
+	data, _ := json.Marshal(f.actor.Snapshot())
 
-    return &GStateSnapshot{data: data}, nil
+	return &GStateSnapshot{data: data}, nil
 
 }
-
- 
 
 func (f *GStateFSM) Restore(rc io.ReadCloser) error {
 
-    f.mu.Lock()
+	f.mu.Lock()
 
-    defer f.mu.Unlock()
+	defer f.mu.Unlock()
 
-    defer rc.Close()
+	defer rc.Close()
 
-    var loaded gstate.Snapshot[SystemState, SystemStatus]
+	var loaded gstate.Snapshot[SystemState, SystemStatus]
 
-    if err := json.NewDecoder(rc).Decode(&loaded); err != nil {
+	if err := json.NewDecoder(rc).Decode(&loaded); err != nil {
 
-        return err
+		return err
 
-    }
+	}
 
-    f.actor.Stop()
+	f.actor.Stop()
 
-    f.actor = gstate.Hydrate(f.machine, loaded, f.machine.WithObservers(&loggingObs{}))
+	f.actor = gstate.Hydrate(f.machine, loaded, f.machine.WithObservers(&loggingObs{}))
 
-    fmt.Println("♻️ [FSM] Durum başarıyla Raft snapshot'ından geri yüklendi.")
+	fmt.Println("♻️ [FSM] Durum başarıyla Raft snapshot'ından geri yüklendi.")
 
-    return nil
+	return nil
 
 }
 
- 
-
 type GStateSnapshot struct{ data []byte }
-
- 
 
 func (s *GStateSnapshot) Persist(sink raft.SnapshotSink) error {
 
-    _, err := sink.Write(s.data)
+	_, err := sink.Write(s.data)
 
-    sink.Close()
+	sink.Close()
 
-    return err
+	return err
 
 }
 
 func (s *GStateSnapshot) Release() {}
 
- 
-
 type JoinRequest struct {
+	NodeID string `json:"node_id"`
 
-    NodeID   string `json:"node_id"`
+	RaftAddr string `json:"raft_addr"`
+}
 
-    RaftAddr string `json:"raft_addr"`
+type ClusterMember struct {
+	NodeID string
+
+	RaftAddr string
+}
+
+type AppConfig struct {
+	NodeID string
+
+	RaftPort string
+
+	HTTPPort string
+
+	ClusterMembers []ClusterMember
+}
+
+var nodeRegistry map[string]string
+
+func usage() string {
+
+	return "Kullanım: go run main.go --node-name node-1 --raft-port 5001 --http-port 8001 --cluster-members 127.0.0.1:5001 127.0.0.1:5002 127.0.0.1:5003"
 
 }
 
- 
+func parseAppConfig(args []string) (AppConfig, error) {
 
-var nodeRegistry = map[string]string{
+	cfg := AppConfig{}
 
-    "node-1": "127.0.0.1:8001",
+	for i := 0; i < len(args); i++ {
 
-    "node-2": "127.0.0.1:8002",
+		switch args[i] {
 
-    "node-3": "127.0.0.1:8003",
+		case "--node-name", "-node-name":
+
+			i++
+
+			if i >= len(args) {
+
+				return cfg, fmt.Errorf("%s değeri eksik", args[i-1])
+
+			}
+
+			cfg.NodeID = args[i]
+
+		case "--raft-port", "-raft-port":
+
+			i++
+
+			if i >= len(args) {
+
+				return cfg, fmt.Errorf("%s değeri eksik", args[i-1])
+
+			}
+
+			cfg.RaftPort = args[i]
+
+		case "--http-port", "-http-port", "http-port":
+
+			i++
+
+			if i >= len(args) {
+
+				return cfg, fmt.Errorf("%s değeri eksik", args[i-1])
+
+			}
+
+			cfg.HTTPPort = args[i]
+
+		case "--cluster-members", "-cluster-members":
+
+			i++
+
+			if i >= len(args) {
+
+				return cfg, fmt.Errorf("%s değeri eksik", args[i-1])
+
+			}
+
+			for i < len(args) && !strings.HasPrefix(args[i], "-") {
+
+				for _, rawAddr := range strings.Split(args[i], ",") {
+
+					addr := strings.TrimSpace(rawAddr)
+
+					if addr == "" {
+
+						continue
+
+					}
+
+					cfg.ClusterMembers = append(cfg.ClusterMembers, ClusterMember{
+
+						NodeID: fmt.Sprintf("node-%d", len(cfg.ClusterMembers)+1),
+
+						RaftAddr: addr,
+					})
+
+				}
+
+				i++
+
+			}
+
+			i--
+
+		default:
+
+			return cfg, fmt.Errorf("bilinmeyen argüman: %s", args[i])
+
+		}
+
+	}
+
+	if cfg.NodeID == "" || cfg.RaftPort == "" || cfg.HTTPPort == "" || len(cfg.ClusterMembers) == 0 {
+
+		return cfg, fmt.Errorf("eksik argüman")
+
+	}
+
+	if _, err := strconv.Atoi(cfg.RaftPort); err != nil {
+
+		return cfg, fmt.Errorf("geçersiz raft portu %q: %w", cfg.RaftPort, err)
+
+	}
+
+	if _, err := strconv.Atoi(cfg.HTTPPort); err != nil {
+
+		return cfg, fmt.Errorf("geçersiz HTTP portu %q: %w", cfg.HTTPPort, err)
+
+	}
+
+	for _, member := range cfg.ClusterMembers {
+
+		if _, _, err := net.SplitHostPort(member.RaftAddr); err != nil {
+
+			return cfg, fmt.Errorf("geçersiz cluster member adresi %q: %w", member.RaftAddr, err)
+
+		}
+
+	}
+
+	nodeExists := false
+	nodeRaftAddr := ""
+	for _, member := range cfg.ClusterMembers {
+		if member.NodeID == cfg.NodeID {
+			nodeExists = true
+			nodeRaftAddr = member.RaftAddr
+			break
+		}
+	}
+	if !nodeExists {
+		return cfg, fmt.Errorf("node name %q cluster members icinde yok; adresler sirayla node-1, node-2 olarak adlandirilir", cfg.NodeID)
+	}
+	_, nodeRaftPort, err := net.SplitHostPort(nodeRaftAddr)
+	if err != nil {
+		return cfg, err
+	}
+	if nodeRaftPort != cfg.RaftPort {
+		return cfg, fmt.Errorf("node name %q icin raft port %s bekleniyor, %s verildi", cfg.NodeID, nodeRaftPort, cfg.RaftPort)
+	}
+
+	return cfg, nil
 
 }
 
- 
+func buildHTTPRegistry(members []ClusterMember, raftPort, httpPort string) (map[string]string, error) {
+
+	raftPortNum, err := strconv.Atoi(raftPort)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+	httpPortNum, err := strconv.Atoi(httpPort)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+	portOffset := httpPortNum - raftPortNum
+
+	registry := make(map[string]string, len(members))
+
+	for _, member := range members {
+
+		host, port, err := net.SplitHostPort(member.RaftAddr)
+
+		if err != nil {
+
+			return nil, err
+
+		}
+
+		raftMemberPort, err := strconv.Atoi(port)
+
+		if err != nil {
+
+			return nil, err
+
+		}
+
+		registry[member.NodeID] = net.JoinHostPort(host, strconv.Itoa(raftMemberPort+portOffset))
+
+	}
+
+	return registry, nil
+
+}
 
 func main() {
 
-    if len(os.Args) < 5 {
+	appConfig, err := parseAppConfig(os.Args[1:])
 
-        log.Fatalf("Kullanım: go run main.go <node-id> <raft-port> <http-port> <bootstrap-true/false> [join-http-url]")
+	if err != nil {
 
-    }
+		log.Fatalf("%v\n%s", err, usage())
 
- 
+	}
 
-    nodeID := os.Args[1]
+	nodeID := appConfig.NodeID
 
-    raftPort := os.Args[2]
+	raftPort := appConfig.RaftPort
 
-    httpPort := os.Args[3]
+	httpPort := appConfig.HTTPPort
 
-    bootstrap, _ := strconv.ParseBool(os.Args[4])
+	nodeRegistry, err = buildHTTPRegistry(appConfig.ClusterMembers, raftPort, httpPort)
 
- 
+	if err != nil {
 
-    raftAddr := fmt.Sprintf("127.0.0.1:%s", raftPort)
+		log.Fatalf("HTTP registry oluşturulamadı: %v", err)
 
- 
+	}
 
-    config := raft.DefaultConfig()
+	raftAddr := fmt.Sprintf("127.0.0.1:%s", raftPort)
 
-    config.LocalID = raft.ServerID(nodeID)
+	config := raft.DefaultConfig()
 
-    config.LogOutput = io.Discard
+	config.LocalID = raft.ServerID(nodeID)
 
- 
+	config.LogOutput = io.Discard
 
-    fsm := NewGStateFSM()
+	fsm := NewGStateFSM()
 
-    store := raft.NewInmemStore()
+	store := raft.NewInmemStore()
 
-    snapshotStore := raft.NewInmemSnapshotStore()
+	snapshotStore := raft.NewInmemSnapshotStore()
 
- 
+	transport, err := raft.NewTCPTransport(raftAddr, nil, 3, 10*time.Second, io.Discard)
 
-    transport, err := raft.NewTCPTransport(raftAddr, nil, 3, 10*time.Second, io.Discard)
+	if err != nil {
 
-    if err != nil {
+		log.Fatalf("Transport hatası: %v", err)
 
-        log.Fatalf("Transport hatası: %v", err)
+	}
 
-    }
+	r, err := raft.NewRaft(config, fsm, store, store, snapshotStore, transport)
 
- 
+	if err != nil {
 
-    r, err := raft.NewRaft(config, fsm, store, store, snapshotStore, transport)
+		log.Fatalf("Raft başlatılamadı: %v", err)
 
-    if err != nil {
+	}
 
-        log.Fatalf("Raft başlatılamadı: %v", err)
+	raftServers := make([]raft.Server, 0, len(appConfig.ClusterMembers))
 
-    }
+	for _, member := range appConfig.ClusterMembers {
 
- 
+		raftServers = append(raftServers, raft.Server{
 
-    if bootstrap {
+			ID: raft.ServerID(member.NodeID),
 
-        configuration := raft.Configuration{
+			Address: raft.ServerAddress(member.RaftAddr),
+		})
 
-            Servers: []raft.Server{{ID: config.LocalID, Address: transport.LocalAddr()}},
+	}
 
-        }
+	if appConfig.ClusterMembers[0].NodeID == nodeID {
 
-        r.BootstrapCluster(configuration)
+		bootstrapFuture := r.BootstrapCluster(raft.Configuration{Servers: raftServers})
 
-        fmt.Println("🚀 Küme Lider olarak başlatıldı.")
+		if err := bootstrapFuture.Error(); err != nil {
 
-    }
+			log.Fatalf("Küme başlatılamadı: %v", err)
 
- 
+		}
 
-    forwardToLeader := func(w http.ResponseWriter, req *http.Request, bodyBytes []byte) bool {
+		fmt.Printf("🚀 Küme yapılandırıldı: %+v\n", raftServers)
 
-        if r.State() == raft.Leader {
+	} else {
 
-            return false
+		fmt.Printf("⏳ Küme üyesi olarak başlatıldı: %s (%s)\n", nodeID, raftAddr)
 
-        }
+	}
 
-        _, leaderID := r.LeaderWithID()
+	forwardToLeader := func(w http.ResponseWriter, req *http.Request, bodyBytes []byte) bool {
 
-        if leaderID == "" {
+		if r.State() == raft.Leader {
 
-            http.Error(w, "Kümede şu an aktif bir lider bulunamadı.", http.StatusServiceUnavailable)
+			return false
 
-            return true
+		}
 
-        }
+		_, leaderID := r.LeaderWithID()
 
-        leaderHTTPAddr, exists := nodeRegistry[string(leaderID)]
+		if leaderID == "" {
 
-        if !exists {
+			http.Error(w, "Kümede şu an aktif bir lider bulunamadı.", http.StatusServiceUnavailable)
 
-            http.Error(w, "Liderin HTTP adresi bulunamadı.", http.StatusServiceUnavailable)
+			return true
 
-            return true
+		}
 
-        }
+		leaderHTTPAddr, exists := nodeRegistry[string(leaderID)]
 
-        leaderURL := fmt.Sprintf("http://%s%s", leaderHTTPAddr, req.URL.Path)
+		if !exists {
 
-        log.Printf("🔀 [Forwarding] İstek Lidere Yönlendiriliyor -> %s", leaderURL)
+			http.Error(w, "Liderin HTTP adresi bulunamadı.", http.StatusServiceUnavailable)
 
- 
+			return true
 
-        proxyReq, err := http.NewRequest(req.Method, leaderURL, bytes.NewBuffer(bodyBytes))
+		}
 
-        if err != nil {
+		leaderURL := fmt.Sprintf("http://%s%s", leaderHTTPAddr, req.URL.Path)
 
-            http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("🔀 [Forwarding] İstek Lidere Yönlendiriliyor -> %s", leaderURL)
 
-            return true
+		proxyReq, err := http.NewRequest(req.Method, leaderURL, bytes.NewBuffer(bodyBytes))
 
-        }
+		if err != nil {
 
-        proxyReq.Header = req.Header
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 
- 
+			return true
 
-        client := &http.Client{Timeout: 5 * time.Second}
+		}
 
-        resp, err := client.Do(proxyReq)
+		proxyReq.Header = req.Header
 
-        if err != nil {
+		client := &http.Client{Timeout: 5 * time.Second}
 
-            http.Error(w, fmt.Sprintf("Lidere yönlendirme hatası: %v", err), http.StatusBadGateway)
+		resp, err := client.Do(proxyReq)
 
-            return true
+		if err != nil {
 
-        }
+			http.Error(w, fmt.Sprintf("Lidere yönlendirme hatası: %v", err), http.StatusBadGateway)
 
-        defer resp.Body.Close()
+			return true
 
- 
+		}
 
-        w.WriteHeader(resp.StatusCode)
+		defer resp.Body.Close()
 
-        io.Copy(w, resp.Body)
+		w.WriteHeader(resp.StatusCode)
 
-        return true
+		io.Copy(w, resp.Body)
 
-    }
+		return true
 
- 
+	}
 
-    http.HandleFunc("/join", func(w http.ResponseWriter, req *http.Request) {
+	http.HandleFunc("/join", func(w http.ResponseWriter, req *http.Request) {
 
-        bodyBytes, _ := io.ReadAll(req.Body)
+		bodyBytes, _ := io.ReadAll(req.Body)
 
-        if forwardToLeader(w, req, bodyBytes) {
+		if forwardToLeader(w, req, bodyBytes) {
 
-            return
+			return
 
-        }
+		}
 
-        var joinReq JoinRequest
+		var joinReq JoinRequest
 
-        if err := json.Unmarshal(bodyBytes, &joinReq); err != nil {
+		if err := json.Unmarshal(bodyBytes, &joinReq); err != nil {
 
-            http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 
-            return
+			return
 
-        }
+		}
 
-        log.Printf("🔗 [LIDER] Yeni düğüm ekleniyor -> ID: %s, Adres: %s", joinReq.NodeID, joinReq.RaftAddr)
+		log.Printf("🔗 [LIDER] Yeni düğüm ekleniyor -> ID: %s, Adres: %s", joinReq.NodeID, joinReq.RaftAddr)
 
-        future := r.AddVoter(raft.ServerID(joinReq.NodeID), raft.ServerAddress(joinReq.RaftAddr), 0, 0)
+		future := r.AddVoter(raft.ServerID(joinReq.NodeID), raft.ServerAddress(joinReq.RaftAddr), 0, 0)
 
-        if err := future.Error(); err != nil {
+		if err := future.Error(); err != nil {
 
-            http.Error(w, fmt.Sprintf("Node eklenemedi: %v", err), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("Node eklenemedi: %v", err), http.StatusInternalServerError)
 
-            return
+			return
 
-        }
+		}
 
-        w.Write([]byte("Başarıyla eklendi"))
+		w.Write([]byte("Başarıyla eklendi"))
 
-    })
+	})
 
- 
+	http.HandleFunc("/report", func(w http.ResponseWriter, req *http.Request) {
 
-    http.HandleFunc("/report", func(w http.ResponseWriter, req *http.Request) {
+		bodyBytes, _ := io.ReadAll(req.Body)
 
-        bodyBytes, _ := io.ReadAll(req.Body)
+		if forwardToLeader(w, req, bodyBytes) {
 
-        if forwardToLeader(w, req, bodyBytes) {
+			return
 
-            return
+		}
 
-        }
+		var reportCmd struct {
+			Value string `json:"value"`
+		}
 
-        var reportCmd struct {
+		if err := json.Unmarshal(bodyBytes, &reportCmd); err != nil {
 
-            Value string `json:"value"`
+			http.Error(w, err.Error(), http.StatusBadRequest)
 
-        }
+			return
 
-        if err := json.Unmarshal(bodyBytes, &reportCmd); err != nil {
+		}
 
-            http.Error(w, err.Error(), http.StatusBadRequest)
+		cmd := LogCommand{Op: CommandSendReport, Value: reportCmd.Value}
 
-            return
+		data, _ := json.Marshal(cmd)
 
-        }
+		applyFuture := r.Apply(data, 5*time.Second)
 
- 
+		if err := applyFuture.Error(); err != nil {
 
-        cmd := LogCommand{Op: CommandSendReport, Value: reportCmd.Value}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 
-        data, _ := json.Marshal(cmd)
+			return
 
- 
+		}
 
-        applyFuture := r.Apply(data, 5*time.Second)
+		w.Write([]byte("Rapor işlendi."))
 
-        if err := applyFuture.Error(); err != nil {
+	})
 
-            http.Error(w, err.Error(), http.StatusInternalServerError)
+	go func() {
 
-            return
+		log.Printf("🌐 HTTP Sunucu Başlatıldı: %s", httpPort)
 
-        }
+		if err := http.ListenAndServe("127.0.0.1:"+httpPort, nil); err != nil {
 
-        w.Write([]byte("Rapor işlendi."))
+			log.Fatalf("HTTP sunucu hatası: %v", err)
 
-    })
+		}
 
- 
+	}()
 
-    go func() {
+	// 💡 YENİ: AÇILIŞTA OTOMATİK RAPOR YAYINLAMA RUTİNİ
 
-        log.Printf("🌐 HTTP Sunucu Başlatıldı: %s", httpPort)
+	go func() {
 
-        if err := http.ListenAndServe("127.0.0.1:"+httpPort, nil); err != nil {
+		// Düğümün tamamen ayağa kalkması ve (eğer follower ise) kümeye bağlanması için biraz bekliyoruz
 
-            log.Fatalf("HTTP sunucu hatası: %v", err)
+		time.Sleep(4 * time.Second)
 
-        }
+		myReportValue := fmt.Sprintf("Startup-Report-From-%s", nodeID)
 
-    }()
+		payload, _ := json.Marshal(map[string]string{"value": myReportValue})
 
- 
+		// Kendi üzerimizdeki yerel HTTP endpoint'e istek atıyoruz.
 
-    if len(os.Args) == 6 {
+		// Eğer follower isek, yazdığımız HTTP katmanı bunu otomatik olarak Lidere forward edecektir.
 
-        joinTargetURL := os.Args[5]
+		localURL := fmt.Sprintf("http://127.0.0.1:%s/report", httpPort)
 
-        time.Sleep(2 * time.Second)
+		log.Printf("🤖 [Auto-Startup] Otomatik rapor gönderiliyor: %s", myReportValue)
 
-        reqBody, _ := json.Marshal(JoinRequest{NodeID: nodeID, RaftAddr: raftAddr})
+		resp, err := http.Post(localURL, "application/json", bytes.NewBuffer(payload))
 
-        resp, err := http.Post(joinTargetURL, "application/json", bytes.NewBuffer(reqBody))
+		if err != nil {
 
-        if err != nil || resp.StatusCode != http.StatusOK {
+			log.Printf("❌ [Auto-Startup] Rapor gönderme hatası: %v", err)
 
-            log.Fatalf("❌ Kümeye katılım sağlanamadı: %v", err)
+			return
 
-        }
+		}
 
-        fmt.Println("✅ Kümeye başarıyla dahil olundu!")
+		defer resp.Body.Close()
 
-    }
+		log.Printf("✅ [Auto-Startup] Rapor başarıyla küme kuyruğuna iletildi. Durum kodu: %d", resp.StatusCode)
 
- 
+	}()
 
-    // 💡 YENİ: AÇILIŞTA OTOMATİK RAPOR YAYINLAMA RUTİNİ
+	// CLI İzleme
 
-    go func() {
+	go func() {
 
-        // Düğümün tamamen ayağa kalkması ve (eğer follower ise) kümeye bağlanması için biraz bekliyoruz
+		scanner := bufio.NewScanner(os.Stdin)
 
-        time.Sleep(4 * time.Second)
+		for scanner.Scan() {
 
- 
+			if strings.TrimSpace(scanner.Text()) == "status" {
 
-        myReportValue := fmt.Sprintf("Startup-Report-From-%s", nodeID)
+				fsm.mu.Lock()
 
-        payload, _ := json.Marshal(map[string]string{"value": myReportValue})
+				fmt.Printf("📊 [%s - %s] Durum: %v | Raporlar: %+v\n", nodeID, r.State(), fsm.actor.States(), fsm.actor.Snapshot().Data.Reports)
 
- 
+				fsm.mu.Unlock()
 
-        // Kendi üzerimizdeki yerel HTTP endpoint'e istek atıyoruz.
+			}
 
-        // Eğer follower isek, yazdığımız HTTP katmanı bunu otomatik olarak Lidere forward edecektir.
+		}
 
-        localURL := fmt.Sprintf("http://127.0.0.1:%s/report", httpPort)
+	}()
 
-        log.Printf("🤖 [Auto-Startup] Otomatik rapor gönderiliyor: %s", myReportValue)
-
- 
-
-        resp, err := http.Post(localURL, "application/json", bytes.NewBuffer(payload))
-
-        if err != nil {
-
-            log.Printf("❌ [Auto-Startup] Rapor gönderme hatası: %v", err)
-
-            return
-
-        }
-
-        defer resp.Body.Close()
-
-        log.Printf("✅ [Auto-Startup] Rapor başarıyla küme kuyruğuna iletildi. Durum kodu: %d", resp.StatusCode)
-
-    }()
-
- 
-
-    // CLI İzleme
-
-    go func() {
-
-        scanner := bufio.NewScanner(os.Stdin)
-
-        for scanner.Scan() {
-
-            if strings.TrimSpace(scanner.Text()) == "status" {
-
-                fsm.mu.Lock()
-
-                fmt.Printf("📊 [%s - %s] Durum: %v | Raporlar: %+v\n", nodeID, r.State(), fsm.actor.States(), fsm.actor.Snapshot().Data.Reports)
-
-                fsm.mu.Unlock()
-
-            }
-
-        }
-
-    }()
-
- 
-
-    select {}
+	select {}
 
 }
-
- 
