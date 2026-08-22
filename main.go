@@ -1,927 +1,276 @@
 package main
 
 import (
-	"bufio"
-
-	"bytes"
-
 	"context"
-
 	"encoding/json"
-
+	"flag"
 	"fmt"
-
 	"io"
-
-	"log"
-
 	"net"
-
-	"net/http"
-
-	"os"
-
-	"strconv"
-
+	"slices"
 	"strings"
-
 	"sync"
-
 	"time"
-
-	"github.com/floodfx/gstate"
 
 	"github.com/hashicorp/raft"
 )
 
-// Tip tanımlamaları ve modeller öncekiyle aynı
-
-type SystemState string
-
-type SystemEvent string
-
-const (
-	StateProcessing SystemState = "Processing"
-
-	StateCollecting SystemState = "Collecting"
-
-	StateWindowing SystemState = "Windowing"
-
-	StateDone SystemState = "Done"
-
-	EventReport SystemEvent = "Report"
-)
-
-type SystemStatus struct {
-	Reports []string `json:"reports"`
+type AppConfig struct {
+	NodeID            string
+	RaftAddr          string
+	HttpAddr          string
+	BootstrapServers  []string
+	BootstrapDelay    int
+	ExpectedBootstrap int
 }
 
-func (s SystemStatus) Clone() SystemStatus {
-
-	reports := make([]string, len(s.Reports))
-
-	copy(reports, s.Reports)
-
-	return SystemStatus{Reports: reports}
-
+func parseConfig() *AppConfig {
+	c := &AppConfig{
+		NodeID:            "node1",
+		RaftAddr:          "127.0.0.1:9001",
+		HttpAddr:          "127.0.0.1:8001",
+		BootstrapServers:  []string{"node-1@127.0.0.1:9091"},
+		BootstrapDelay:    5,
+		ExpectedBootstrap: 3,
+	}
+	flag.StringVar(&c.NodeID, "node-id", c.NodeID, "Node ID")
+	flag.StringVar(&c.RaftAddr, "raft-addr", c.RaftAddr, "Raft address")
+	flag.StringVar(&c.HttpAddr, "http-addr", c.HttpAddr, "HTTP address")
+	flag.Func("bootstrap-servers", "Bootstrap servers (comma-separated)", func(s string) error {
+		c.BootstrapServers = strings.Split(s, ",")
+		if i := slices.Index(c.BootstrapServers, c.RaftAddr); i >= 0 {
+			c.BootstrapServers = slices.Delete(c.BootstrapServers, i, i+1)
+		}
+		return nil
+	})
+	flag.IntVar(&c.BootstrapDelay, "bootstrap-delay", c.BootstrapDelay, "Bootstrap delay in seconds")
+	flag.IntVar(&c.ExpectedBootstrap, "expected-bootstrap", c.ExpectedBootstrap, "Expected number of bootstrap nodes")
+	flag.Parse()
+	return c
 }
 
-type CommandType string
-
-const CommandSendReport CommandType = "SendReport"
-
-type LogCommand struct {
-	Op CommandType `json:"op"`
-
-	Value string `json:"value"`
+type TimeFSM struct {
+	mu   sync.RWMutex
+	data map[string]string
+}
+type Command struct {
+	Op    string `json:"op"`
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
 }
 
-// FSM Tanımı
-
-type GStateFSM struct {
-	mu sync.Mutex
-
-	machine *gstate.Machine[SystemState, SystemEvent, SystemStatus]
-
-	actor *gstate.Actor[SystemState, SystemEvent, SystemStatus]
-
-	pendingReport string
+func NewTimeFSM() *TimeFSM {
+	return &TimeFSM{
+		data: make(map[string]string),
+	}
 }
+func (f *TimeFSM) Apply(log *raft.Log) interface{} {
+	var cmd Command
 
-func NewGStateFSM() *GStateFSM {
-
-	fsm := &GStateFSM{}
-
-	builder := gstate.New[SystemState, SystemEvent, SystemStatus]("distributed-test").
-		Initial(StateProcessing).
-		State(StateProcessing, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
-
-			sb.Initial(StateCollecting)
-
-			sb.On(EventReport).Assign(func(ss SystemStatus) SystemStatus {
-
-				if fsm.pendingReport != "" {
-
-					ss.Reports = append(ss.Reports, fsm.pendingReport)
-
-					fmt.Printf("📝 [gstate Assign] Rapor eklendi: %s\n", fsm.pendingReport)
-
-					fsm.pendingReport = ""
-
-				}
-
-				return ss
-
-			})
-
-			sb.State(StateCollecting, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
-
-				sb.Always().Guard(func(ss SystemStatus) bool { return len(ss.Reports) >= 3 }).GoTo(StateWindowing)
-
-			})
-
-			sb.State(StateWindowing, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
-
-				sb.After(5 * time.Second).GoTo(StateDone)
-
-			})
-
-			sb.Always().Guard(func(ss SystemStatus) bool { return len(ss.Reports) >= 6 }).GoTo(StateDone)
-
-		}).
-		State(StateDone, func(sb *gstate.StateBuilder[SystemState, SystemEvent, SystemStatus]) {
-
-			sb.Type(gstate.Final)
-
-			sb.Entry(func(ss SystemStatus) SystemStatus {
-
-				fmt.Printf("\n🎉 [FSM] Final duruma ulaşıldı: %+v\n", ss)
-
-				return ss
-
-			})
-
-		})
-
-	fsm.machine = builder.Build()
-
-	fsm.actor = gstate.Start(fsm.machine, SystemStatus{}, fsm.machine.WithObservers(&loggingObs{}))
-
-	return fsm
-
-}
-
-type loggingObs struct {
-	gstate.BaseObserver[SystemState, SystemEvent, SystemStatus]
-}
-
-func (l *loggingObs) OnTransition(ctx context.Context, e *gstate.TransitionEvent[SystemState, SystemEvent, SystemStatus]) {
-
-	log.Printf("🔄 [%s] %s --%s--> %s | %+v", e.ActorID, e.From, e.Event, e.To, e.Data().Reports)
-
-}
-
-func (f *GStateFSM) Apply(l *raft.Log) interface{} {
-
-	f.mu.Lock()
-
-	defer f.mu.Unlock()
-
-	var cmd LogCommand
-
-	if err := json.Unmarshal(l.Data, &cmd); err != nil {
-
+	if err := json.Unmarshal(log.Data, &cmd); err != nil {
 		return err
-
 	}
 
-	if cmd.Op == CommandSendReport {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
-		f.pendingReport = cmd.Value
+	switch cmd.Op {
 
-		f.actor.Send(EventReport)
+	case "set":
+		f.data[cmd.Key] = cmd.Value
 
+	case "delete":
+		delete(f.data, cmd.Key)
+
+	default:
+		return fmt.Errorf("unknown command: %s", cmd.Op)
 	}
 
 	return nil
+}
+func (f *TimeFSM) Snapshot() (raft.FSMSnapshot, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 
+	data := make(map[string]string, len(f.data))
+
+	for k, v := range f.data {
+		data[k] = v
+	}
+
+	return &FSMSnapshot{
+		data: data,
+	}, nil
 }
 
-func (f *GStateFSM) Snapshot() (raft.FSMSnapshot, error) {
-
-	f.mu.Lock()
-
-	defer f.mu.Unlock()
-
-	data, _ := json.Marshal(f.actor.Snapshot())
-
-	return &GStateSnapshot{data: data}, nil
-
-}
-
-func (f *GStateFSM) Restore(rc io.ReadCloser) error {
-
-	f.mu.Lock()
-
-	defer f.mu.Unlock()
-
+func (f *TimeFSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 
-	var loaded gstate.Snapshot[SystemState, SystemStatus]
+	data := make(map[string]string)
 
-	if err := json.NewDecoder(rc).Decode(&loaded); err != nil {
-
+	if err := json.NewDecoder(rc).Decode(&data); err != nil {
 		return err
-
 	}
 
-	f.actor.Stop()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
-	f.actor = gstate.Hydrate(f.machine, loaded, f.machine.WithObservers(&loggingObs{}))
-
-	fmt.Println("♻️ [FSM] Durum başarıyla Raft snapshot'ından geri yüklendi.")
+	f.data = data
 
 	return nil
-
 }
 
-type GStateSnapshot struct{ data []byte }
-
-func (s *GStateSnapshot) Persist(sink raft.SnapshotSink) error {
-
-	_, err := sink.Write(s.data)
-
-	sink.Close()
-
-	return err
-
+type FSMSnapshot struct {
+	data map[string]string
 }
 
-func (s *GStateSnapshot) Release() {}
+func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
+	if err := json.NewEncoder(sink).Encode(s.data); err != nil {
+		_ = sink.Cancel()
+		return err
+	}
 
-type JoinRequest struct {
-	NodeID string `json:"node_id"`
-
-	RaftAddr string `json:"raft_addr"`
+	return sink.Close()
 }
 
-type ClusterMember struct {
-	NodeID string
-
-	RaftAddr string
-}
-
-type AppConfig struct {
-	NodeID string
-
-	RaftPort string
-
-	HTTPPort string
-
-	BootstrapExpected int
-
-	BootstrapDelay time.Duration
-
-	ClusterMembers []ClusterMember
-}
-
-var nodeRegistry map[string]string
-
-func usage() string {
-
-	return "Usage: go run main.go --node-name node-1 --raft-port 5001 --http-port 8001 --bootstrap-expected 3 --bootstrap-delay 5s --cluster-members 127.0.0.1:5001 127.0.0.1:5002 127.0.0.1:5003"
-
-}
-
-func parseAppConfig(args []string) (AppConfig, error) {
-
-	cfg := AppConfig{BootstrapDelay: 5 * time.Second}
-
-	for i := 0; i < len(args); i++ {
-
-		switch args[i] {
-
-		case "--node-name", "-node-name":
-
-			i++
-
-			if i >= len(args) {
-
-				return cfg, fmt.Errorf("%s değeri eksik", args[i-1])
-
-			}
-
-			cfg.NodeID = args[i]
-
-		case "--raft-port", "-raft-port":
-
-			i++
-
-			if i >= len(args) {
-
-				return cfg, fmt.Errorf("%s değeri eksik", args[i-1])
-
-			}
-
-			cfg.RaftPort = args[i]
-
-		case "--http-port", "-http-port", "http-port":
-
-			i++
-
-			if i >= len(args) {
-
-				return cfg, fmt.Errorf("%s değeri eksik", args[i-1])
-
-			}
-
-			cfg.HTTPPort = args[i]
-
-		case "--bootstrap-expected", "-bootstrap-expected":
-
-			i++
-
-			if i >= len(args) {
-
-				return cfg, fmt.Errorf("%s deÄŸeri eksik", args[i-1])
-
-			}
-
-			expected, err := strconv.Atoi(args[i])
-
-			if err != nil {
-
-				return cfg, fmt.Errorf("gecersiz bootstrap expected %q: %w", args[i], err)
-
-			}
-
-			cfg.BootstrapExpected = expected
-
-		case "--bootstrap-delay", "-bootstrap-delay", "--bootstrap-time", "-bootstrap-time":
-
-			i++
-
-			if i >= len(args) {
-
-				return cfg, fmt.Errorf("%s deÄŸeri eksik", args[i-1])
-
-			}
-
-			delay, err := time.ParseDuration(args[i])
-
-			if err != nil {
-
-				return cfg, fmt.Errorf("gecersiz bootstrap delay %q: %w", args[i], err)
-
-			}
-
-			cfg.BootstrapDelay = delay
-
-		case "--cluster-members", "-cluster-members":
-
-			i++
-
-			if i >= len(args) {
-
-				return cfg, fmt.Errorf("%s değeri eksik", args[i-1])
-
-			}
-
-			for i < len(args) && !strings.HasPrefix(args[i], "-") {
-
-				for _, rawAddr := range strings.Split(args[i], ",") {
-
-					addr := strings.TrimSpace(rawAddr)
-
-					if addr == "" {
-
-						continue
-
-					}
-
-					cfg.ClusterMembers = append(cfg.ClusterMembers, ClusterMember{
-
-						NodeID: fmt.Sprintf("node-%d", len(cfg.ClusterMembers)+1),
-
-						RaftAddr: addr,
-					})
-
-				}
-
-				i++
-
-			}
-
-			i--
-
-		default:
-
-			return cfg, fmt.Errorf("bilinmeyen argüman: %s", args[i])
-
-		}
-
-	}
-
-	if cfg.NodeID == "" || cfg.RaftPort == "" || cfg.HTTPPort == "" || len(cfg.ClusterMembers) == 0 {
-
-		return cfg, fmt.Errorf("eksik argüman")
-
-	}
-
-	if cfg.BootstrapExpected == 0 {
-
-		cfg.BootstrapExpected = len(cfg.ClusterMembers)
-
-	}
-
-	if cfg.BootstrapExpected < 1 || cfg.BootstrapExpected > len(cfg.ClusterMembers) {
-
-		return cfg, fmt.Errorf("bootstrap expected %d, 1 ile cluster member sayisi %d arasinda olmali", cfg.BootstrapExpected, len(cfg.ClusterMembers))
-
-	}
-
-	if cfg.BootstrapDelay < 0 {
-
-		return cfg, fmt.Errorf("bootstrap delay negatif olamaz")
-
-	}
-
-	if _, err := strconv.Atoi(cfg.RaftPort); err != nil {
-
-		return cfg, fmt.Errorf("geçersiz raft portu %q: %w", cfg.RaftPort, err)
-
-	}
-
-	if _, err := strconv.Atoi(cfg.HTTPPort); err != nil {
-
-		return cfg, fmt.Errorf("geçersiz HTTP portu %q: %w", cfg.HTTPPort, err)
-
-	}
-
-	for _, member := range cfg.ClusterMembers {
-
-		if _, _, err := net.SplitHostPort(member.RaftAddr); err != nil {
-
-			return cfg, fmt.Errorf("geçersiz cluster member adresi %q: %w", member.RaftAddr, err)
-
-		}
-
-	}
-
-	nodeExists := false
-	nodeRaftAddr := ""
-	for _, member := range cfg.ClusterMembers {
-		if member.NodeID == cfg.NodeID {
-			nodeExists = true
-			nodeRaftAddr = member.RaftAddr
-			break
-		}
-	}
-	if !nodeExists {
-		return cfg, fmt.Errorf("node name %q cluster members icinde yok; adresler sirayla node-1, node-2 olarak adlandirilir", cfg.NodeID)
-	}
-	_, nodeRaftPort, err := net.SplitHostPort(nodeRaftAddr)
-	if err != nil {
-		return cfg, err
-	}
-	if nodeRaftPort != cfg.RaftPort {
-		return cfg, fmt.Errorf("node name %q icin raft port %s bekleniyor, %s verildi", cfg.NodeID, nodeRaftPort, cfg.RaftPort)
-	}
-
-	return cfg, nil
-
-}
-
-func buildHTTPRegistry(members []ClusterMember, raftPort, httpPort string) (map[string]string, error) {
-
-	raftPortNum, err := strconv.Atoi(raftPort)
-
-	if err != nil {
-
-		return nil, err
-
-	}
-
-	httpPortNum, err := strconv.Atoi(httpPort)
-
-	if err != nil {
-
-		return nil, err
-
-	}
-
-	portOffset := httpPortNum - raftPortNum
-
-	registry := make(map[string]string, len(members))
-
-	for _, member := range members {
-
-		host, port, err := net.SplitHostPort(member.RaftAddr)
-
-		if err != nil {
-
-			return nil, err
-
-		}
-
-		raftMemberPort, err := strconv.Atoi(port)
-
-		if err != nil {
-
-			return nil, err
-
-		}
-
-		registry[member.NodeID] = net.JoinHostPort(host, strconv.Itoa(raftMemberPort+portOffset))
-
-	}
-
-	return registry, nil
-
-}
-
-func raftAddrForNode(members []ClusterMember, nodeID string) (string, bool) {
-
-	for _, member := range members {
-
-		if member.NodeID == nodeID {
-
-			return member.RaftAddr, true
-
-		}
-
-	}
-
-	return "", false
-
-}
-
-func countAvailableMembers(members []ClusterMember, localRaftAddr string, timeout time.Duration) int {
-
-	available := 0
-
-	for _, member := range members {
-
-		if member.RaftAddr == localRaftAddr {
-
-			available++
-
-			continue
-
-		}
-
-		conn, err := net.DialTimeout("tcp", member.RaftAddr, timeout)
-
-		if err != nil {
-
-			continue
-
-		}
-
-		conn.Close()
-
-		available++
-
-	}
-
-	return available
-
-}
-
-func waitForBootstrapQuorum(members []ClusterMember, localRaftAddr string, expected int, delay time.Duration) {
-
-	for {
-
-		available := countAvailableMembers(members, localRaftAddr, 500*time.Millisecond)
-
-		if available < expected {
-
-			log.Printf("[Bootstrap] %d/%d node reachable; waiting for bootstrap expected %d", available, len(members), expected)
-
-			time.Sleep(time.Second)
-
-			continue
-
-		}
-
-		log.Printf("[Bootstrap] bootstrap expected reached: %d/%d node reachable; waiting %s before bootstrapping", available, len(members), delay)
-
-		time.Sleep(delay)
-
-		available = countAvailableMembers(members, localRaftAddr, 500*time.Millisecond)
-
-		if available >= expected {
-
-			log.Printf("[Bootstrap] bootstrap delay completed with %d/%d node reachable", available, len(members))
-
-			return
-
-		}
-
-		log.Printf("[Bootstrap] node availability dropped to %d/%d during bootstrap delay; waiting again", available, len(members))
-
-	}
-
-}
-
-func bootstrapCluster(r *raft.Raft, servers []raft.Server) error {
-
-	err := r.BootstrapCluster(raft.Configuration{Servers: servers}).Error()
-
-	if err == nil {
-
-		log.Printf("[Bootstrap] cluster initialized")
-
-		return nil
-
-	}
-
-	if strings.Contains(err.Error(), "bootstrap only works on new clusters") {
-
-		log.Printf("[Bootstrap] cluster already initialized by another node")
-
-		return nil
-
-	}
-
-	return err
-
+func (s *FSMSnapshot) Release() {
 }
 
 func main() {
 
-	appConfig, err := parseAppConfig(os.Args[1:])
+	config := parseConfig()
+	fmt.Printf("Starting node with config: %+v\n", config)
 
-	if err != nil {
-
-		log.Fatalf("%v\n%s", err, usage())
-
-	}
-
-	nodeID := appConfig.NodeID
-
-	raftPort := appConfig.RaftPort
-
-	httpPort := appConfig.HTTPPort
-
-	nodeRegistry, err = buildHTTPRegistry(appConfig.ClusterMembers, raftPort, httpPort)
-
-	if err != nil {
-
-		log.Fatalf("HTTP registry oluşturulamadı: %v", err)
-
-	}
-
-	raftAddr, ok := raftAddrForNode(appConfig.ClusterMembers, nodeID)
-
-	if !ok {
-
-		log.Fatalf("Node adresi bulunamadÄ±: %s", nodeID)
-
-	}
-
-	config := raft.DefaultConfig()
-
-	config.LocalID = raft.ServerID(nodeID)
-
-	config.LogOutput = io.Discard
-
-	fsm := NewGStateFSM()
-
-	store := raft.NewInmemStore()
+	raftConfig := raft.DefaultConfig()
+	raftConfig.LocalID = raft.ServerID(config.NodeID)
+	raftConfig.Logger = nil // Disable logging for simplicity
+	raftConfig.SnapshotInterval = 30 * time.Second
+	raftConfig.SnapshotThreshold = 100
 
 	snapshotStore := raft.NewInmemSnapshotStore()
+	logStore := raft.NewInmemStore()
 
-	transport, err := raft.NewTCPTransport(raftAddr, nil, 3, 10*time.Second, io.Discard)
-
+	transport, err := raft.NewTCPTransport(config.RaftAddr, nil, 3, 10*time.Second, nil)
 	if err != nil {
-
-		log.Fatalf("Transport hatası: %v", err)
-
+		fmt.Printf("Failed to create transport: %v\n", err)
+		return
 	}
 
-	r, err := raft.NewRaft(config, fsm, store, store, snapshotStore, transport)
+	fsm := NewTimeFSM()
 
+	r, err := raft.NewRaft(raftConfig, fsm, logStore, logStore, snapshotStore, transport)
 	if err != nil {
-
-		log.Fatalf("Raft başlatılamadı: %v", err)
-
+		fmt.Printf("Failed to create Raft node: %v\n", err)
+		return
+	}
+	bootstrapServers, others, err := waitForBootstrap(context.Background(), config.BootstrapServers, config.ExpectedBootstrap-1)
+	if err != nil {
+		fmt.Printf("Failed to wait for bootstrap servers: %v\n", err)
+		return
 	}
 
-	raftServers := make([]raft.Server, 0, len(appConfig.ClusterMembers))
-
-	for _, member := range appConfig.ClusterMembers {
-
-		raftServers = append(raftServers, raft.Server{
-
-			ID: raft.ServerID(member.NodeID),
-
-			Address: raft.ServerAddress(member.RaftAddr),
-		})
-
+	fmt.Printf("initial bootstrap servers ready: %+v\n", bootstrapServers)
+	for other := range others {
+		fmt.Printf("Other bootstrap server ready: %s\n", other)
 	}
-
-	waitForBootstrapQuorum(appConfig.ClusterMembers, raftAddr, appConfig.BootstrapExpected, appConfig.BootstrapDelay)
-
-	if err := bootstrapCluster(r, raftServers); err != nil {
-
-		log.Fatalf("Kume baslatilamadi: %v", err)
-
-	}
-
-	fmt.Printf("Kume otomatik yapilandirildi: %+v\n", raftServers)
-	forwardToLeader := func(w http.ResponseWriter, req *http.Request, bodyBytes []byte) bool {
-
-		if r.State() == raft.Leader {
-
-			return false
-
-		}
-
-		_, leaderID := r.LeaderWithID()
-
-		if leaderID == "" {
-
-			http.Error(w, "Kümede şu an aktif bir lider bulunamadı.", http.StatusServiceUnavailable)
-
-			return true
-
-		}
-
-		leaderHTTPAddr, exists := nodeRegistry[string(leaderID)]
-
-		if !exists {
-
-			http.Error(w, "Liderin HTTP adresi bulunamadı.", http.StatusServiceUnavailable)
-
-			return true
-
-		}
-
-		leaderURL := fmt.Sprintf("http://%s%s", leaderHTTPAddr, req.URL.Path)
-
-		log.Printf("🔀 [Forwarding] İstek Lidere Yönlendiriliyor -> %s", leaderURL)
-
-		proxyReq, err := http.NewRequest(req.Method, leaderURL, bytes.NewBuffer(bodyBytes))
-
-		if err != nil {
-
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-
-			return true
-
-		}
-
-		proxyReq.Header = req.Header
-
-		client := &http.Client{Timeout: 5 * time.Second}
-
-		resp, err := client.Do(proxyReq)
-
-		if err != nil {
-
-			http.Error(w, fmt.Sprintf("Lidere yönlendirme hatası: %v", err), http.StatusBadGateway)
-
-			return true
-
-		}
-
-		defer resp.Body.Close()
-
-		w.WriteHeader(resp.StatusCode)
-
-		io.Copy(w, resp.Body)
-
-		return true
-
-	}
-
-	http.HandleFunc("/join", func(w http.ResponseWriter, req *http.Request) {
-
-		bodyBytes, _ := io.ReadAll(req.Body)
-
-		if forwardToLeader(w, req, bodyBytes) {
-
-			return
-
-		}
-
-		var joinReq JoinRequest
-
-		if err := json.Unmarshal(bodyBytes, &joinReq); err != nil {
-
-			http.Error(w, err.Error(), http.StatusBadRequest)
-
-			return
-
-		}
-
-		log.Printf("🔗 [LIDER] Yeni düğüm ekleniyor -> ID: %s, Adres: %s", joinReq.NodeID, joinReq.RaftAddr)
-
-		future := r.AddVoter(raft.ServerID(joinReq.NodeID), raft.ServerAddress(joinReq.RaftAddr), 0, 0)
-
-		if err := future.Error(); err != nil {
-
-			http.Error(w, fmt.Sprintf("Node eklenemedi: %v", err), http.StatusInternalServerError)
-
-			return
-
-		}
-
-		w.Write([]byte("Başarıyla eklendi"))
-
-	})
-
-	http.HandleFunc("/report", func(w http.ResponseWriter, req *http.Request) {
-
-		bodyBytes, _ := io.ReadAll(req.Body)
-
-		if forwardToLeader(w, req, bodyBytes) {
-
-			return
-
-		}
-
-		var reportCmd struct {
-			Value string `json:"value"`
-		}
-
-		if err := json.Unmarshal(bodyBytes, &reportCmd); err != nil {
-
-			http.Error(w, err.Error(), http.StatusBadRequest)
-
-			return
-
-		}
-
-		cmd := LogCommand{Op: CommandSendReport, Value: reportCmd.Value}
-
-		data, _ := json.Marshal(cmd)
-
-		applyFuture := r.Apply(data, 5*time.Second)
-
-		if err := applyFuture.Error(); err != nil {
-
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-
-			return
-
-		}
-
-		w.Write([]byte("Rapor işlendi."))
-
-	})
-
-	go func() {
-
-		log.Printf("🌐 HTTP Sunucu Başlatıldı: %s", httpPort)
-
-		if err := http.ListenAndServe("127.0.0.1:"+httpPort, nil); err != nil {
-
-			log.Fatalf("HTTP sunucu hatası: %v", err)
-
-		}
-
-	}()
-
-	// 💡 YENİ: AÇILIŞTA OTOMATİK RAPOR YAYINLAMA RUTİNİ
-
-	go func() {
-
-		// Düğümün tamamen ayağa kalkması ve (eğer follower ise) kümeye bağlanması için biraz bekliyoruz
-
-		time.Sleep(4 * time.Second)
-
-		myReportValue := fmt.Sprintf("Startup-Report-From-%s", nodeID)
-
-		payload, _ := json.Marshal(map[string]string{"value": myReportValue})
-
-		// Kendi üzerimizdeki yerel HTTP endpoint'e istek atıyoruz.
-
-		// Eğer follower isek, yazdığımız HTTP katmanı bunu otomatik olarak Lidere forward edecektir.
-
-		localURL := fmt.Sprintf("http://127.0.0.1:%s/report", httpPort)
-
-		log.Printf("🤖 [Auto-Startup] Otomatik rapor gönderiliyor: %s", myReportValue)
-
-		resp, err := http.Post(localURL, "application/json", bytes.NewBuffer(payload))
-
-		if err != nil {
-
-			log.Printf("❌ [Auto-Startup] Rapor gönderme hatası: %v", err)
-
-			return
-
-		}
-
-		defer resp.Body.Close()
-
-		log.Printf("✅ [Auto-Startup] Rapor başarıyla küme kuyruğuna iletildi. Durum kodu: %d", resp.StatusCode)
-
-	}()
-
-	// CLI İzleme
-
-	go func() {
-
-		scanner := bufio.NewScanner(os.Stdin)
-
-		for scanner.Scan() {
-
-			if strings.TrimSpace(scanner.Text()) == "status" {
-
-				fsm.mu.Lock()
-
-				fmt.Printf("📊 [%s - %s] Durum: %v | Raporlar: %+v\n", nodeID, r.State(), fsm.actor.States(), fsm.actor.Snapshot().Data.Reports)
-
-				fsm.mu.Unlock()
-
-			}
-
-		}
-
-	}()
-
+	fmt.Printf("Raft node created with ID: %+v\n", r.LastIndex())
 	select {}
 
+}
+
+func waitForBootstrap(
+	ctx context.Context,
+	servers []string,
+	expected int,
+) ([]string, <-chan string, error) {
+
+	if expected <= 0 || expected > len(servers) {
+		return nil, nil, fmt.Errorf(
+			"invalid expected count: %d, total servers: %d",
+			expected,
+			len(servers),
+		)
+	}
+
+	readyNodes := make(chan string, len(servers))
+
+	var wg sync.WaitGroup
+
+	for _, server := range servers {
+		server := server
+
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				conn, err := net.DialTimeout("tcp", server, 2*time.Second)
+
+				if err == nil {
+					conn.Close()
+
+					fmt.Printf(
+						"Successfully connected to bootstrap server: %s\n",
+						server,
+					)
+
+					select {
+					case readyNodes <- server:
+					case <-ctx.Done():
+					}
+
+					return
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+
+				case <-ticker.C:
+					// retry
+				}
+			}
+		}()
+	}
+
+	// Close channel only when every server worker has finished.
+	go func() {
+		wg.Wait()
+		close(readyNodes)
+	}()
+
+	fmt.Printf(
+		"Waiting for %d/%d bootstrap servers...\n",
+		expected,
+		len(servers),
+	)
+
+	bootstrapServers := make([]string, 0, expected)
+
+	for len(bootstrapServers) < expected {
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+
+		case ready, ok := <-readyNodes:
+			if !ok {
+				return nil, nil, fmt.Errorf(
+					"only %d/%d bootstrap servers became ready",
+					len(bootstrapServers),
+					expected,
+				)
+			}
+
+			fmt.Printf("Bootstrap server ready: %s\n", ready)
+
+			bootstrapServers = append(bootstrapServers, ready)
+		}
+	}
+
+	// Remaining ready servers will continue arriving here.
+	return bootstrapServers, readyNodes, nil
 }
