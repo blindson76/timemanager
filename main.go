@@ -72,20 +72,35 @@ func parsePeers(servers []string) ([]peerServer, error) {
 }
 
 type clusterState struct {
-	State  string `json:"state"`
-	Leader string `json:"leader"`
+	State  string       `json:"state"`
+	Leader string       `json:"leader"`
+	Peers  []peerServer `json:"peers,omitempty"`
 }
 
 // serveClusterState exposes this node's raft state over HTTP so peers can
 // tell, without any local persistence, whether the cluster is already up.
-func serveClusterState(addr string, r *raft.Raft) {
+func serveClusterService(addr string, r *raft.Raft) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/state", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(clusterState{
 			State:  r.State().String(),
 			Leader: string(r.Leader()),
+			Peers: func() []peerServer {
+				servers := r.GetConfiguration().Configuration().Servers
+				peers := make([]peerServer, len(servers))
+				for i, s := range servers {
+					peers[i] = peerServer{ID: s.ID, Addr: s.Address, HTTPAddr: ""} // HTTPAddr is not available from raft.Server
+				}
+				return peers
+			}(),
 		})
+	})
+
+	mux.HandleFunc("/join", func(w http.ResponseWriter, req *http.Request) {
+		// Handle join requests here
+		requestedID := req.URL.Query().Get("id")
+		w.Write([]byte("id:" + requestedID))
 	})
 
 	go func() {
@@ -98,15 +113,15 @@ func serveClusterState(addr string, r *raft.Raft) {
 // discoverClusterLeader asks every peer for its known raft leader. If any
 // peer reports one, the cluster has already been bootstrapped by someone
 // else (or before a restart), and this node must not bootstrap again.
-func discoverClusterLeader(ctx context.Context, peers []peerServer, timeout time.Duration) string {
+func discoverClusterLeader(ctx context.Context, peers []peerServer, timeout time.Duration) *clusterState {
 	if len(peers) == 0 {
-		return ""
+		return nil
 	}
 
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	resultChan := make(chan string, len(peers))
+	resultChan := make(chan *clusterState, len(peers))
 
 	// 1. WaitGroup ile kaç tane goroutine olduğunu takip ediyoruz
 	var wg sync.WaitGroup
@@ -135,7 +150,7 @@ func discoverClusterLeader(ctx context.Context, peers []peerServer, timeout time
 
 			if state.Leader != "" {
 				select {
-				case resultChan <- state.Leader: // Başarılı: Lideri kanala atıyor
+				case resultChan <- &state: // Başarılı: Lideri kanala atıyor
 				case <-cancelCtx.Done():
 				}
 			}
@@ -155,12 +170,12 @@ func discoverClusterLeader(ctx context.Context, peers []peerServer, timeout time
 			if !ok {
 				// Eğer tüm peer'lar başarısız olduysa, wg.Wait() çalışır ve kanal kapatılır.
 				// Kanal kapatıldığı an ok değeri 'false' olur ve kod beklemeden BURADAN ÇIKAR.
-				return ""
+				return nil
 			}
 			// Eğer bir tane bile başarılı sonuç geldiyse anında lideri döner
 			return leader
 		case <-ctx.Done():
-			return ""
+			return nil
 		}
 	}
 }
@@ -189,6 +204,7 @@ func (f *TimeFSM) Apply(log *raft.Log) interface{} {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	fmt.Printf("Applying command: %+v\n", cmd)
 
 	switch cmd.Op {
 
@@ -207,6 +223,7 @@ func (f *TimeFSM) Apply(log *raft.Log) interface{} {
 func (f *TimeFSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	fmt.Printf("Creating snapshot with data: %+v\n", f.data)
 
 	data := make(map[string]string, len(f.data))
 
@@ -222,6 +239,7 @@ func (f *TimeFSM) Snapshot() (raft.FSMSnapshot, error) {
 func (f *TimeFSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 
+	fmt.Printf("Restoring snapshot from reader: %+v\n", rc)
 	data := make(map[string]string)
 
 	if err := json.NewDecoder(rc).Decode(&data); err != nil {
@@ -241,6 +259,7 @@ type FSMSnapshot struct {
 }
 
 func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
+	fmt.Printf("Persisting snapshot with data: %+v\n", s.data)
 	if err := json.NewEncoder(sink).Encode(s.data); err != nil {
 		_ = sink.Cancel()
 		return err
@@ -252,6 +271,7 @@ func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
 func (s *FSMSnapshot) Release() {
 }
 
+// go run . --node-id node-1 --raft-addr 127.0.0.1:9001 --http-addr 127.0.0.1:8001 --bootstrap-servers node-1@127.0.0.1:9001@127.0.0.1:8001,node-2@127.0.0.1:9002@127.0.0.1:8002,node-3@127.0.0.1:9003@127.0.0.1:8003,node-4@127.0.0.1:9004@12.0.0.1:8004 --expected-bootstrap 3
 func main() {
 
 	ctx := context.Background()
@@ -267,8 +287,9 @@ func main() {
 	raftConfig := raft.DefaultConfig()
 	raftConfig.LocalID = raft.ServerID(config.NodeID)
 	raftConfig.LogOutput = io.Discard // Disable logging for simplicity
-	raftConfig.SnapshotInterval = 30 * time.Second
-	raftConfig.SnapshotThreshold = 100
+	raftConfig.SnapshotInterval = 5 * time.Second
+	raftConfig.SnapshotThreshold = 10
+	raftConfig.TrailingLogs = 2
 
 	snapshotStore := raft.NewInmemSnapshotStore()
 	logStore := raft.NewInmemStore()
@@ -286,13 +307,14 @@ func main() {
 		fmt.Printf("Failed to create Raft node: %v\n", err)
 		return
 	}
+	var otherChan <-chan peerServer
 
 	eventChan := make(chan raft.Observation, 50)
 	observer := raft.NewObserver(eventChan, true, func(o *raft.Observation) bool {
 		return true
 	})
 	r.RegisterObserver(observer)
-	serveClusterState(config.HttpAddr, r)
+	serveClusterService(config.HttpAddr, r)
 	otherPeers := make([]peerServer, len(peers))
 	copy(otherPeers, peers)
 	slices.DeleteFunc(otherPeers, func(p peerServer) bool {
@@ -304,9 +326,14 @@ func main() {
 	leader := discoverClusterLeader(ctx, otherPeers, 2*time.Second)
 
 	fmt.Printf("Discovered cluster leader: %s\n", leader)
-	if leader != "" {
-		fmt.Printf("Cluster already has a leader (%s), skipping bootstrap.\n", leader)
+	if leader != nil {
+		fmt.Printf("Cluster already has a leader (%v), skipping bootstrap.\n", leader)
+		if !slices.ContainsFunc(leader.Peers, func(p peerServer) bool {
+			return p.ID == raftConfig.LocalID
+		}) {
+			fmt.Printf("Local node ID %s is not part of the cluster, joining as a follower.\n", raftConfig.LocalID)
 
+		}
 	} else {
 		fmt.Printf("No leader discovered, waiting for %d/%d bootstrap servers...\n", config.ExpectedBootstrap, len(peers))
 		orderedPeers := make([]peerServer, len(peers))
@@ -328,6 +355,7 @@ func main() {
 			fmt.Printf("Failed to wait for bootstrap servers: %v\n", err)
 			return
 		}
+		otherChan = others
 		bootStrapDelay := time.Duration(2*(peerIndex-1)+config.BootstrapDelay) * time.Second
 		bootStrapTimer := time.NewTimer(bootStrapDelay)
 		fmt.Printf("Bootstrap timer set for %v (peer index: %d)\n", bootStrapDelay, peerIndex)
@@ -339,8 +367,8 @@ func main() {
 				fmt.Printf("Bootstrapping with: %v...\n", initialPeers)
 
 				servers := make([]raft.Server, 0, len(peers)+1)
-				// servers = append(servers, raft.Server{ID: raftConfig.LocalID, Address: raft.ServerAddress(config.RaftAddr)})
-				for _, p := range peers {
+				servers = append(servers, raft.Server{ID: raftConfig.LocalID, Address: raft.ServerAddress(config.RaftAddr)})
+				for _, p := range initialPeers {
 					servers = append(servers, raft.Server{ID: p.ID, Address: p.Addr})
 				}
 
@@ -380,6 +408,35 @@ func main() {
 		fmt.Printf("Bootstrap completed with %d/%d servers ready.\n", len(initialPeers), config.ExpectedBootstrap)
 	}
 
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+
+	counter := 0
+loop2:
+	for {
+		select {
+		case <-ticker.C:
+			if r.State() == raft.Leader {
+				Command := Command{Op: "set", Key: "time", Value: fmt.Sprintf("%d", counter)}
+				counter++
+				if data, err := json.Marshal(Command); err == nil {
+					r.Apply(data, time.Second*3).Error()
+				}
+			}
+		case peer, ok := <-otherChan:
+			if ok {
+				fmt.Printf("Other bootstrap server ready: %s\n", peer)
+				if err := r.AddVoter(peer.ID, peer.Addr, 0, 0).Error(); err != nil {
+					fmt.Printf("Failed to add voter: %v\n", err)
+				} else {
+					fmt.Printf("Added voter: %s\n", peer)
+				}
+			}
+		case <-ctx.Done():
+			fmt.Printf("Context cancelled while monitoring Raft state: %v\n", ctx.Err())
+			break loop2
+		}
+	}
 	fmt.Printf("Raft node started with ID: %s\n", raftConfig.LocalID)
 	select {}
 
@@ -481,3 +538,5 @@ func waitForBootstrap(
 	// Remaining ready servers will continue arriving here.
 	return bootstrapServers, readyNodes, nil
 }
+
+//go run . --node-id node-1 --raft-addr 127.0.0.1:9001 --http-addr 127.0.0.1:8001 --bootstrap-servers node-1@127.0.0.1:9001@127.0.0.1:8001,node-2@127.0.0.1:9002@127.0.0.1:8002,node-3@127.0.0.1:9003@127.0.0.1:8003,node-4@127.0.0.1:9004@12.0.0.1:8004 --expected-bootstrap 3
