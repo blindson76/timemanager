@@ -110,9 +110,6 @@ func serveClusterService(addr string, r *raft.Raft) {
 	}()
 }
 
-// discoverClusterLeader asks every peer for its known raft leader. If any
-// peer reports one, the cluster has already been bootstrapped by someone
-// else (or before a restart), and this node must not bootstrap again.
 func discoverClusterLeader(ctx context.Context, peers []peerServer, timeout time.Duration) *clusterState {
 	if len(peers) == 0 {
 		return nil
@@ -123,56 +120,50 @@ func discoverClusterLeader(ctx context.Context, peers []peerServer, timeout time
 
 	resultChan := make(chan *clusterState, len(peers))
 
-	// 1. WaitGroup ile kaç tane goroutine olduğunu takip ediyoruz
 	var wg sync.WaitGroup
 
 	for _, p := range peers {
 		wg.Add(1)
 		go func(peer peerServer) {
-			defer wg.Done() // İş bitince (başarılı veya başarısız) sayacı 1 azalt
+			defer wg.Done()
 
 			client := &http.Client{Timeout: timeout}
 			req, err := http.NewRequestWithContext(cancelCtx, http.MethodGet, "http://"+peer.HTTPAddr+"/state", nil)
 			if err != nil {
-				return // Başarısız: direkt çıkıyor, kanala veri atmıyor
+				return
 			}
 
 			resp, err := client.Do(req)
 			if err != nil {
-				return // Başarısız: direkt çıkıyor, kanala veri atmıyor
+				return
 			}
 			defer resp.Body.Close()
 
 			var state clusterState
 			if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
-				return // Başarısız: direkt çıkıyor, kanala veri atmıyor
+				return
 			}
 
 			if state.Leader != "" {
 				select {
-				case resultChan <- &state: // Başarılı: Lideri kanala atıyor
+				case resultChan <- &state:
 				case <-cancelCtx.Done():
 				}
 			}
 		}(p)
 	}
 
-	// 2. TÜM GOROUTINE'LERİN BİTMESİNİ BEKLEYEN ARKA PLAN İŞİ
 	go func() {
-		wg.Wait()         // Tüm goroutine'ler (başarılı/başarısız) bittiğinde burası tetiklenir
-		close(resultChan) // Kanalı kapatıyoruz. Kapatılan kanaldan veri okumak tıkanmaz!
+		wg.Wait()
+		close(resultChan)
 	}()
 
-	// 3. ARTIK BURADA ASLA TAKILIP KALMAZ
 	for {
 		select {
 		case leader, ok := <-resultChan:
 			if !ok {
-				// Eğer tüm peer'lar başarısız olduysa, wg.Wait() çalışır ve kanal kapatılır.
-				// Kanal kapatıldığı an ok değeri 'false' olur ve kod beklemeden BURADAN ÇIKAR.
 				return nil
 			}
-			// Eğer bir tane bile başarılı sonuç geldiyse anında lideri döner
 			return leader
 		case <-ctx.Done():
 			return nil
