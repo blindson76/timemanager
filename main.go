@@ -287,6 +287,11 @@ func main() {
 		return
 	}
 
+	eventChan := make(chan raft.Observation, 50)
+	observer := raft.NewObserver(eventChan, true, func(o *raft.Observation) bool {
+		return true
+	})
+	r.RegisterObserver(observer)
 	serveClusterState(config.HttpAddr, r)
 	otherPeers := make([]peerServer, len(peers))
 	copy(otherPeers, peers)
@@ -324,12 +329,13 @@ func main() {
 			return
 		}
 		bootStrapDelay := time.Duration(2*(peerIndex-1)+config.BootstrapDelay) * time.Second
-		bootStrapTime := time.NewTimer(bootStrapDelay)
+		bootStrapTimer := time.NewTimer(bootStrapDelay)
 		fmt.Printf("Bootstrap timer set for %v (peer index: %d)\n", bootStrapDelay, peerIndex)
+	loop:
 		for {
 
 			select {
-			case <-bootStrapTime.C:
+			case <-bootStrapTimer.C:
 				fmt.Printf("Bootstrapping with: %v...\n", initialPeers)
 
 				servers := make([]raft.Server, 0, len(peers)+1)
@@ -345,10 +351,25 @@ func main() {
 				}
 
 				fmt.Printf("Cluster bootstrap initiated successfully. %v\n", err)
+				break loop
 			case peer, ok := <-others:
 				if ok {
 					initialPeers = append(initialPeers, peer)
 					fmt.Printf("Other bootstrap server ready: %s\n", peer)
+				}
+			case evet := <-eventChan:
+				switch e := evet.Data.(type) {
+				case raft.RaftState:
+					fmt.Printf("Raft state observation: %v\n", e)
+				case raft.LeaderObservation:
+					if e.LeaderAddr != "" {
+						fmt.Printf("Leader elected: %v\n", e)
+						break loop
+					}
+				case raft.PeerObservation:
+					fmt.Printf("Peer observation: %v\n", e)
+					bootStrapTimer.Stop()
+					break loop
 				}
 			case <-ctx.Done():
 				fmt.Printf("Context cancelled while waiting to bootstrap: %v\n", ctx.Err())
@@ -356,6 +377,7 @@ func main() {
 
 			}
 		}
+		fmt.Printf("Bootstrap completed with %d/%d servers ready.\n", len(initialPeers), config.ExpectedBootstrap)
 	}
 
 	fmt.Printf("Raft node started with ID: %s\n", raftConfig.LocalID)
