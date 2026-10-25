@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -51,5 +52,38 @@ members:
 	}
 	if _, err := loadConfig(filepath.Join(t.TempDir(), "missing.yaml"), "node-1"); err == nil {
 		t.Fatal("expected missing file error")
+	}
+}
+
+func TestLoadConfigServices(t *testing.T) {
+	c, err := loadConfig("cluster.yaml", "node-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Services) != 4 || c.Services[2].Name != "billing" || len(c.Services[2].DependsOn) != 2 {
+		t.Fatalf("unexpected services: %+v", c.Services)
+	}
+	if c.Services[0].StartTimeout != defaultStartTimeout*time.Second || c.Services[0].RetryDelay != defaultRetryDelay*time.Second {
+		t.Fatalf("defaults not applied: %+v", c.Services[0])
+	}
+}
+
+func TestParseServicesRejectsInvalid(t *testing.T) {
+	for name, services := range map[string][]serviceConfig{
+		"empty name":     {{Name: ""}},
+		"duplicate":      {{Name: "a"}, {Name: "a"}},
+		"reserved name":  {{Name: "timesync"}},
+		"unknown dep":    {{Name: "a", DependsOn: []string{"b"}}},
+		"negative delay": {{Name: "a", RetryDelay: -1}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseServices(services); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+	specs, err := parseServices([]serviceConfig{{Name: "b", DependsOn: []string{"a"}}, {Name: "a", DependsOn: []string{"timesync"}, StartTimeout: 5}})
+	if err != nil || specs[1].StartTimeout != 5*time.Second {
+		t.Fatalf("forward reference or custom timeout failed: %+v, %v", specs, err)
 	}
 }

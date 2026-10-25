@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"example.com/mystate/executor"
 	"github.com/blindson76/gstate"
 )
 
@@ -158,6 +159,20 @@ func (*LogObserver) OnStateExited(ctx context.Context, e *gstate.StateEvent[Clus
 func (*LogObserver) OnEventReceived(ctx context.Context, e *gstate.EventNotice[ClusterState, Event, ClusterStatus]) {
 	log.Printf("[%s] Event received: %+v", e.ActorID, e)
 }
+// Health reports Ready once a time source has been decided and the peers
+// have been ordered to follow it.
+//
+// TODO: tighten to "orders acknowledged" once agents report OrderReport.
+func Health(states []ClusterState, _ ClusterStatus) executor.Health {
+	for _, s := range states {
+		switch s {
+		case ClusterStateServerRunning, ClusterStateAutoStarting, ClusterStateManualPeersStarting:
+			return executor.HealthReady
+		}
+	}
+	return executor.HealthPending
+}
+
 // InitialStatus is the data a fresh cluster machine starts from.
 func InitialStatus() ClusterStatus {
 	return ClusterStatus{

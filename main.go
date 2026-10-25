@@ -15,17 +15,21 @@ import (
 	"sync"
 	"time"
 
+	"example.com/mystate/controllers/service"
 	"example.com/mystate/executor"
 	timesm "example.com/mystate/time"
 	"github.com/hashicorp/raft"
 )
 
-type clusterFSM = executor.FSM[timesm.ClusterState, timesm.Event, timesm.ClusterStatus]
+// timesyncController is the controller name of the time state machine.
+const timesyncController = "timesync"
 
-// eventRequest is the body of POST /order: an external event for the leader to replicate.
+// eventRequest is the body of POST /order: an external event for the leader
+// to replicate to one controller.
 type eventRequest struct {
-	Event timesm.Event `json:"event"`
-	Args  any          `json:"args"`
+	Controller string `json:"controller"`
+	Event      string `json:"event"`
+	Args       any    `json:"args,omitempty"`
 }
 
 type clusterState struct {
@@ -36,7 +40,7 @@ type clusterState struct {
 
 // serveClusterState exposes this node's raft state over HTTP so peers can
 // tell, without any local persistence, whether the cluster is already up.
-func serveClusterService(addr string, r *raft.Raft, fsm *clusterFSM, nodeID string) {
+func serveClusterService(addr string, r *raft.Raft, fsm *executor.Executor, nodeID string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/state", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -52,6 +56,11 @@ func serveClusterService(addr string, r *raft.Raft, fsm *clusterFSM, nodeID stri
 				return peers
 			}(),
 		})
+	})
+
+	mux.HandleFunc("GET /controllers", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(fsm.Controllers())
 	})
 
 	mux.HandleFunc("/join", func(w http.ResponseWriter, req *http.Request) {
@@ -75,7 +84,7 @@ func serveClusterService(addr string, r *raft.Raft, fsm *clusterFSM, nodeID stri
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		if err := fsm.Propose(ev.Event, ev.Args); err != nil {
+		if err := fsm.Propose(ev.Controller, ev.Event, ev.Args); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -187,8 +196,20 @@ func main() {
 		return
 	}
 
-	machine := timesm.BuildMachine()
-	fsm := executor.New(machine, timesm.InitialStatus(), machine.WithObservers(&timesm.LogObserver{}))
+	timeMachine := timesm.BuildMachine()
+	ctrls := []executor.Controller{
+		executor.NewController(timesyncController, timeMachine, timesm.InitialStatus()).
+			WithHealth(timesm.Health).
+			WithActorOptions(timeMachine.WithObservers(&timesm.LogObserver{})),
+	}
+	for _, spec := range config.Services {
+		ctrls = append(ctrls, service.New(spec, &service.LogObserver{Name: spec.Name}))
+	}
+	fsm, err := executor.New(ctrls...)
+	if err != nil {
+		fmt.Printf("Failed to create executor: %v\n", err)
+		return
+	}
 	r, err := raft.NewRaft(raftConfig, fsm, logStore, logStore, snapshotStore, transport)
 	if err != nil {
 		fmt.Printf("Failed to create Raft node: %v\n", err)
@@ -316,7 +337,7 @@ func main() {
 	ticker := time.NewTicker(2000 * time.Millisecond)
 	defer ticker.Stop()
 	go func() {
-		cmd := eventRequest{Event: timesm.EventReport, Args: timesm.TimeReport{
+		cmd := eventRequest{Controller: timesyncController, Event: string(timesm.EventReport), Args: timesm.TimeReport{
 			PeerID:            config.NodeID,
 			OrderNumber:       1,
 			TimeMode:          timesm.TimeModeAuto,

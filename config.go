@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 
+	"example.com/mystate/controllers/service"
 	"github.com/hashicorp/raft"
 	"gopkg.in/yaml.v3"
 )
@@ -23,7 +25,14 @@ type AppConfig struct {
 	Peers             []peerServer
 	BootstrapDelay    int
 	ExpectedBootstrap int
+	Services          []service.Spec
 }
+
+// Default service timings, in seconds, when cluster.yaml omits them.
+const (
+	defaultStartTimeout = 60
+	defaultRetryDelay   = 10
+)
 
 type peerServer struct {
 	ID       raft.ServerID
@@ -32,9 +41,17 @@ type peerServer struct {
 }
 
 type clusterFile struct {
-	BootstrapDelay    int            `yaml:"bootstrap_delay"`
-	ExpectedBootstrap int            `yaml:"expected_bootstrap"`
-	Members           []memberConfig `yaml:"members"`
+	BootstrapDelay    int             `yaml:"bootstrap_delay"`
+	ExpectedBootstrap int             `yaml:"expected_bootstrap"`
+	Members           []memberConfig  `yaml:"members"`
+	Services          []serviceConfig `yaml:"services"`
+}
+
+type serviceConfig struct {
+	Name         string   `yaml:"name"`
+	DependsOn    []string `yaml:"depends_on"`
+	StartTimeout int      `yaml:"start_timeout"` // seconds
+	RetryDelay   int      `yaml:"retry_delay"`   // seconds
 }
 
 type memberConfig struct {
@@ -115,5 +132,48 @@ func loadConfig(path, nodeID string) (*AppConfig, error) {
 		return nil, fmt.Errorf("node %q is not a member in %s", nodeID, path)
 	}
 
+	if c.Services, err = parseServices(f.Services); err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+// parseServices validates service names and references and applies default
+// timings. Dependency cycles are rejected later by the executor.
+func parseServices(services []serviceConfig) ([]service.Spec, error) {
+	names := map[string]bool{timesyncController: true}
+	for _, s := range services {
+		if s.Name == "" {
+			return nil, errors.New("service with empty name")
+		}
+		if names[s.Name] {
+			return nil, fmt.Errorf("duplicate or reserved service name %q", s.Name)
+		}
+		names[s.Name] = true
+	}
+
+	specs := make([]service.Spec, 0, len(services))
+	for _, s := range services {
+		for _, dep := range s.DependsOn {
+			if !names[dep] {
+				return nil, fmt.Errorf("service %s: depends on unknown service %q", s.Name, dep)
+			}
+		}
+		if s.StartTimeout < 0 || s.RetryDelay < 0 {
+			return nil, fmt.Errorf("service %s: start_timeout and retry_delay must not be negative", s.Name)
+		}
+		if s.StartTimeout == 0 {
+			s.StartTimeout = defaultStartTimeout
+		}
+		if s.RetryDelay == 0 {
+			s.RetryDelay = defaultRetryDelay
+		}
+		specs = append(specs, service.Spec{
+			Name:         s.Name,
+			DependsOn:    s.DependsOn,
+			StartTimeout: time.Duration(s.StartTimeout) * time.Second,
+			RetryDelay:   time.Duration(s.RetryDelay) * time.Second,
+		})
+	}
+	return specs, nil
 }

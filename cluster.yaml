@@ -16,3 +16,17 @@ members:
   - node_id: node-4
     raft_addr: 127.0.0.1:9004
     http_addr: 127.0.0.1:8004
+
+# Services managed by the orchestrator. Each may depend on "timesync" or on
+# other services; cycles are rejected at startup. A service starts only once
+# all its dependencies are Ready. Optional timings are in seconds
+# (defaults: start_timeout 60, retry_delay 10).
+services:
+  - name: mongo
+    depends_on: [timesync]
+  - name: kafka
+    depends_on: [timesync]
+  - name: billing
+    depends_on: [kafka, mongo]
+  - name: audit
+    depends_on: [kafka]
