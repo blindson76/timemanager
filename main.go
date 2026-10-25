@@ -15,10 +15,18 @@ import (
 	"sync"
 	"time"
 
+	"example.com/mystate/executor"
 	timesm "example.com/mystate/time"
-	"github.com/blindson76/gstate"
 	"github.com/hashicorp/raft"
 )
+
+type clusterFSM = executor.FSM[timesm.ClusterState, timesm.Event, timesm.ClusterStatus]
+
+// eventRequest is the body of POST /order: an external event for the leader to replicate.
+type eventRequest struct {
+	Event timesm.Event `json:"event"`
+	Args  any          `json:"args"`
+}
 
 type clusterState struct {
 	State  string       `json:"state"`
@@ -28,7 +36,7 @@ type clusterState struct {
 
 // serveClusterState exposes this node's raft state over HTTP so peers can
 // tell, without any local persistence, whether the cluster is already up.
-func serveClusterService(addr string, r *raft.Raft, nodeID string) {
+func serveClusterService(addr string, r *raft.Raft, fsm *clusterFSM, nodeID string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/state", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -59,20 +67,18 @@ func serveClusterService(addr string, r *raft.Raft, nodeID string) {
 			return
 		}
 		if string(id) != nodeID {
-			http.Redirect(w, req, "http://"+nodeHttp[string(id)]+"/report", http.StatusTemporaryRedirect)
+			http.Redirect(w, req, "http://"+nodeHttp[string(id)]+"/order", http.StatusTemporaryRedirect)
 			return
 		}
-		var cmd Command
-		if err := json.NewDecoder(req.Body).Decode(&cmd); err != nil {
+		var ev eventRequest
+		if err := json.NewDecoder(req.Body).Decode(&ev); err != nil {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		data, err := json.Marshal(cmd)
-		if err != nil {
-			http.Error(w, "failed to marshal command", http.StatusInternalServerError)
+		if err := fsm.Propose(ev.Event, ev.Args); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		r.Apply(data, time.Second*3).Error()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
@@ -145,118 +151,6 @@ func discoverClusterLeader(ctx context.Context, peers []peerServer, timeout time
 	}
 }
 
-type TimeFSM struct {
-	mu      sync.RWMutex
-	data    map[string]string
-	actor   *gstate.Actor[timesm.ClusterState, timesm.Event, timesm.ClusterStatus]
-	machine *gstate.Machine[timesm.ClusterState, timesm.Event, timesm.ClusterStatus]
-	r       *raft.Raft
-}
-type Command struct {
-	Event timesm.Event `json:"event"`
-	Args  any          `json:"args"`
-}
-
-func NewTimeFSM() *TimeFSM {
-
-	machine := timesm.BuildMachine()
-	actor := gstate.Start(machine, timesm.ClusterStatus{
-		ClusterState: timesm.ClusterStateInitializing,
-		TimeMode:     timesm.TimeModeLocal,
-		Reports:      make(map[string]timesm.TimeReport),
-		Orders:       make(map[string][]timesm.Order),
-	}, false, machine.WithRunToCompletion(), machine.WithObservers(&timesm.LogObserver{}))
-	fmt.Printf("actor %+v\n", actor)
-
-	return &TimeFSM{
-		data:    make(map[string]string),
-		actor:   actor,
-		machine: machine,
-	}
-}
-func (f *TimeFSM) Apply(log *raft.Log) interface{} {
-	var cmd Command
-
-	if err := json.Unmarshal(log.Data, &cmd); err != nil {
-		return err
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	fmt.Printf("Applying command: %+v\n", cmd)
-	if log.Index == f.r.LastIndex() && f.r.State() == raft.Leader {
-		fmt.Printf("Activating state machine\n")
-		f.actor.Activate()
-	}
-
-	f.actor.SendWith(cmd.Event, cmd.Args)
-
-	return nil
-}
-func (f *TimeFSM) Snapshot() (raft.FSMSnapshot, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	fmt.Printf("Creating snapshot with data: %+v\n", f.data)
-
-	data, err := json.Marshal(f.actor.Snapshot())
-	if err != nil {
-		return nil, err
-	}
-
-	return &FSMSnapshot{
-		data: data,
-	}, nil
-}
-
-func (f *TimeFSM) Restore(rc io.ReadCloser) error {
-	defer rc.Close()
-
-	fmt.Printf("Restoring snapshot from reader: %+v\n", rc)
-	var snapshot gstate.Snapshot[timesm.ClusterState, timesm.ClusterStatus]
-	if err := json.NewDecoder(rc).Decode(&snapshot); err != nil {
-		return err
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.actor.Stop()
-	f.actor = gstate.Hydrate(
-		f.machine,
-		snapshot,
-		false,
-		f.machine.WithRunToCompletion(),
-		f.machine.WithObservers(&timesm.LogObserver{}),
-	)
-	fmt.Printf("Machine :%+v\n", f.actor.Snapshot())
-	return nil
-}
-
-type FSMSnapshot struct {
-	data []byte
-}
-
-func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
-	fmt.Printf("Persisting snapshot with data: %+v\n", s.data)
-	n, err := sink.Write(s.data)
-	if err == nil && n != len(s.data) {
-		err = io.ErrShortWrite
-	}
-	if err != nil {
-		_ = sink.Cancel()
-		return err
-	}
-
-	if err := sink.Close(); err != nil {
-		_ = sink.Cancel()
-		return err
-	}
-	return nil
-}
-
-func (s *FSMSnapshot) Release() {
-}
-
 var (
 	nodeHttp map[string]string = make(map[string]string)
 )
@@ -293,13 +187,14 @@ func main() {
 		return
 	}
 
-	fsm := NewTimeFSM()
+	machine := timesm.BuildMachine()
+	fsm := executor.New(machine, timesm.InitialStatus(), machine.WithObservers(&timesm.LogObserver{}))
 	r, err := raft.NewRaft(raftConfig, fsm, logStore, logStore, snapshotStore, transport)
 	if err != nil {
 		fmt.Printf("Failed to create Raft node: %v\n", err)
 		return
 	}
-	fsm.r = r
+	fsm.Attach(r)
 	var otherChan <-chan peerServer
 
 	eventChan := make(chan raft.Observation, 50)
@@ -307,7 +202,7 @@ func main() {
 		return true
 	})
 	r.RegisterObserver(observer)
-	serveClusterService(config.HttpAddr, r, config.NodeID)
+	serveClusterService(config.HttpAddr, r, fsm, config.NodeID)
 	otherPeers := make([]peerServer, len(peers))
 	copy(otherPeers, peers)
 	otherPeers = slices.DeleteFunc(otherPeers, func(p peerServer) bool {
@@ -408,12 +303,11 @@ func main() {
 			case e := <-eventChan:
 				switch ev := e.Data.(type) {
 				case raft.LeaderObservation:
-					if ev.LeaderAddr != "" {
-						if r.State() == raft.Leader {
-							fmt.Printf("I am the leader now: %v\n", ev)
-							fsm.actor.Activate()
-						}
+					leader := r.State() == raft.Leader
+					if leader {
+						fmt.Printf("I am the leader now: %v\n", ev)
 					}
+					fsm.SetLeader(leader)
 				}
 			}
 		}
@@ -422,7 +316,7 @@ func main() {
 	ticker := time.NewTicker(2000 * time.Millisecond)
 	defer ticker.Stop()
 	go func() {
-		cmd := Command{Event: timesm.EventReport, Args: timesm.TimeReport{
+		cmd := eventRequest{Event: timesm.EventReport, Args: timesm.TimeReport{
 			PeerID:            config.NodeID,
 			OrderNumber:       1,
 			TimeMode:          timesm.TimeModeAuto,

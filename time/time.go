@@ -158,6 +158,16 @@ func (*LogObserver) OnStateExited(ctx context.Context, e *gstate.StateEvent[Clus
 func (*LogObserver) OnEventReceived(ctx context.Context, e *gstate.EventNotice[ClusterState, Event, ClusterStatus]) {
 	log.Printf("[%s] Event received: %+v", e.ActorID, e)
 }
+// InitialStatus is the data a fresh cluster machine starts from.
+func InitialStatus() ClusterStatus {
+	return ClusterStatus{
+		ClusterState: ClusterStateInitializing,
+		TimeMode:     TimeModeLocal,
+		Reports:      make(map[string]TimeReport),
+		Orders:       make(map[string][]Order),
+	}
+}
+
 func BuildMachine() *gstate.Machine[ClusterState, Event, ClusterStatus] {
 	builder := gstate.New[ClusterState, Event, ClusterStatus]("ClusterStateMachine").
 		Initial(ClusterStateRoot).
