@@ -133,29 +133,29 @@ func (cs ClusterStatus) buildRepors(ctx context.Context) error {
 	return nil
 }
 
-type logObserver struct {
+type LogObserver struct {
 	gstate.BaseObserver[ClusterState, Event, ClusterStatus]
 } // <-- Eksik olan struct kapatma parantezi eklendi
 
-func (*logObserver) OnTransition(ctx context.Context, e *gstate.TransitionEvent[ClusterState, Event, ClusterStatus]) {
+func (*LogObserver) OnTransition(ctx context.Context, e *gstate.TransitionEvent[ClusterState, Event, ClusterStatus]) {
 	log.Printf("[%s] %s --%s--> %s", e.ActorID, e.From, e.Event, e.To)
 }
-func (*logObserver) OnInvokeCompleted(ctx context.Context, e *gstate.InvokeEvent[ClusterState, Event, ClusterStatus]) {
+func (*LogObserver) OnInvokeCompleted(ctx context.Context, e *gstate.InvokeEvent[ClusterState, Event, ClusterStatus]) {
 	log.Printf("[%s] Invoke Completed Event %+v", e.ActorID, e)
 }
-func (*logObserver) OnInvokeStarted(ctx context.Context, e *gstate.InvokeEvent[ClusterState, Event, ClusterStatus]) {
+func (*LogObserver) OnInvokeStarted(ctx context.Context, e *gstate.InvokeEvent[ClusterState, Event, ClusterStatus]) {
 	log.Printf("[%s] Invoke Started Event %+v", e.ActorID, e)
 }
-func (*logObserver) OnEventDropped(ctx context.Context, e *gstate.EventNotice[ClusterState, Event, ClusterStatus]) {
+func (*LogObserver) OnEventDropped(ctx context.Context, e *gstate.EventNotice[ClusterState, Event, ClusterStatus]) {
 	log.Printf("[%s] Event Dropped in state %+v", e.ActorID, e)
 }
-func (*logObserver) OnStateEntered(ctx context.Context, e *gstate.StateEvent[ClusterState, Event, ClusterStatus]) {
+func (*LogObserver) OnStateEntered(ctx context.Context, e *gstate.StateEvent[ClusterState, Event, ClusterStatus]) {
 	log.Printf("[%s] Entered state %s", e.ActorID, e.State)
 }
-func (*logObserver) OnStateExited(ctx context.Context, e *gstate.StateEvent[ClusterState, Event, ClusterStatus]) {
+func (*LogObserver) OnStateExited(ctx context.Context, e *gstate.StateEvent[ClusterState, Event, ClusterStatus]) {
 	log.Printf("[%s] Exited state %s", e.ActorID, e.State)
 }
-func (*logObserver) OnEventReceived(ctx context.Context, e *gstate.EventNotice[ClusterState, Event, ClusterStatus]) {
+func (*LogObserver) OnEventReceived(ctx context.Context, e *gstate.EventNotice[ClusterState, Event, ClusterStatus]) {
 	log.Printf("[%s] Event received: %+v", e.ActorID, e)
 }
 func BuildMachine() *gstate.Machine[ClusterState, Event, ClusterStatus] {
@@ -163,8 +163,25 @@ func BuildMachine() *gstate.Machine[ClusterState, Event, ClusterStatus] {
 		Initial(ClusterStateRoot).
 		State(ClusterStateRoot, func(sb *gstate.StateBuilder[ClusterState, Event, ClusterStatus]) {
 			sb.Initial(ClusterStateInitializing)
+			sb.Invoke(func(ctx context.Context, snap ClusterStatus, mutate func(func(ClusterStatus) ClusterStatus)) error {
+
+				for {
+					fmt.Printf("Inside invoke loop\n")
+					time.Sleep(time.Second * 2)
+				}
+				return nil
+			}, ClusterStateRoot, ClusterStateRoot)
 			sb.On(EventReport).AssignWith(func(cs ClusterStatus, a any) ClusterStatus {
-				report := a.(TimeReport)
+				fmt.Printf("Raw report data: %+v\n", a)
+				var report TimeReport
+				data, err := json.Marshal(a)
+				if err != nil {
+					return cs
+				}
+				err = json.Unmarshal(data, &report)
+				if err != nil {
+					return cs
+				}
 				cs.Reports[report.PeerID] = report
 				return cs
 			})
@@ -281,7 +298,7 @@ func RunSM() {
 		TimeMode:     TimeModeLocal,
 		Reports:      make(map[string]TimeReport),
 		Orders:       make(map[string][]Order),
-	}, true, builder.WithRunToCompletion(), builder.WithObservers(&logObserver{}))
+	}, true, builder.WithRunToCompletion(), builder.WithObservers(&LogObserver{}))
 	fmt.Printf("Actor started: %v\n", actor.States())
 	actor.SendWith(EventReport, TimeReport{
 		PeerID:            "peer1",
