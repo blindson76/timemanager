@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -60,30 +61,56 @@ func TestLoadConfigServices(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Services) != 4 || c.Services[2].Name != "billing" || len(c.Services[2].DependsOn) != 2 {
-		t.Fatalf("unexpected services: %+v", c.Services)
+	var names []string
+	for _, d := range c.Services {
+		names = append(names, d.name())
 	}
-	if c.Services[0].StartTimeout != defaultStartTimeout*time.Second || c.Services[0].RetryDelay != defaultRetryDelay*time.Second {
-		t.Fatalf("defaults not applied: %+v", c.Services[0])
+	if !slices.Equal(names, []string{"mongo", "kafka", "billing", "audit"}) {
+		t.Fatalf("services = %v", names)
+	}
+	m := c.Services[0].Mongo
+	if m == nil || m.ReplicaSet != "rs0" || m.Replicas != 3 || len(m.Members) != 3 || m.ReportWindow != 15*time.Second || m.AllowForceReconfig {
+		t.Fatalf("mongo spec = %+v", m)
+	}
+	k := c.Services[1].Service
+	if k == nil || k.StartTimeout != defaultStartTimeout*time.Second || k.RetryDelay != defaultRetryDelay*time.Second {
+		t.Fatalf("defaults not applied: %+v", k)
 	}
 }
 
 func TestParseServicesRejectsInvalid(t *testing.T) {
+	nodes := []string{"n1", "n2", "n3"}
 	for name, services := range map[string][]serviceConfig{
-		"empty name":     {{Name: ""}},
-		"duplicate":      {{Name: "a"}, {Name: "a"}},
-		"reserved name":  {{Name: "timesync"}},
-		"unknown dep":    {{Name: "a", DependsOn: []string{"b"}}},
-		"negative delay": {{Name: "a", RetryDelay: -1}},
+		"empty name":           {{Name: ""}},
+		"duplicate":            {{Name: "a"}, {Name: "a"}},
+		"reserved name":        {{Name: "timesync"}},
+		"unknown dep":          {{Name: "a", DependsOn: []string{"b"}}},
+		"negative delay":       {{Name: "a", RetryDelay: -1}},
+		"unknown kind":         {{Name: "a", Kind: "redis"}},
+		"mongo block no kind":  {{Name: "a", Mongo: &mongoConfig{}}},
+		"mongo unknown member": {{Name: "m", Kind: "mongo", Mongo: &mongoConfig{Members: []string{"n9"}}}},
+		"mongo dup member":     {{Name: "m", Kind: "mongo", Mongo: &mongoConfig{Members: []string{"n1", "n1"}}}},
+		"mongo replicas > 7":   {{Name: "m", Kind: "mongo", Mongo: &mongoConfig{Replicas: 8}}},
+		"mongo replicas > n":   {{Name: "m", Kind: "mongo", Mongo: &mongoConfig{Members: []string{"n1"}, Replicas: 2}}},
+		"mongo start_timeout":  {{Name: "m", Kind: "mongo", StartTimeout: 5}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := parseServices(services); err == nil {
+			if _, err := parseServices(services, nodes); err == nil {
 				t.Fatal("expected error")
 			}
 		})
 	}
-	specs, err := parseServices([]serviceConfig{{Name: "b", DependsOn: []string{"a"}}, {Name: "a", DependsOn: []string{"timesync"}, StartTimeout: 5}})
-	if err != nil || specs[1].StartTimeout != 5*time.Second {
-		t.Fatalf("forward reference or custom timeout failed: %+v, %v", specs, err)
+
+	defs, err := parseServices([]serviceConfig{{Name: "b", DependsOn: []string{"a"}}, {Name: "a", DependsOn: []string{"timesync"}, StartTimeout: 5}}, nodes)
+	if err != nil || defs[1].Service.StartTimeout != 5*time.Second {
+		t.Fatalf("forward reference or custom timeout failed: %+v, %v", defs, err)
+	}
+
+	defs, err = parseServices([]serviceConfig{{Name: "db", Kind: "mongo"}}, nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := defs[0].Mongo; m.ReplicaSet != "db" || !slices.Equal(m.Members, nodes) || m.Replicas != 3 || m.OrderTimeout != defaultOrderTimeout*time.Second {
+		t.Fatalf("mongo defaults = %+v", m)
 	}
 }

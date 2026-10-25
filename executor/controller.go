@@ -53,6 +53,7 @@ type Controller interface {
 	hasDependencyEvent() bool
 	health() Health
 	states() []string
+	data() any
 	apply(event string, args json.RawMessage)
 	fireInternal(raw json.RawMessage) (bool, error)
 	dependencyChanged(DependencyChange)
@@ -176,6 +177,8 @@ func (c *Ctrl[S, E, D]) states() []string {
 	}
 	return out
 }
+
+func (c *Ctrl[S, E, D]) data() any { return c.actor.Data() }
 
 func (c *Ctrl[S, E, D]) apply(event string, args json.RawMessage) {
 	if args == nil {

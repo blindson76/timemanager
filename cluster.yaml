@@ -20,10 +20,19 @@ members:
 # Services managed by the orchestrator. Each may depend on "timesync" or on
 # other services; cycles are rejected at startup. A service starts only once
 # all its dependencies are Ready. Optional timings are in seconds
-# (defaults: start_timeout 60, retry_delay 10).
+# (defaults: start_timeout 60, retry_delay 10). kind selects a specialised
+# controller; without it a service gets the generic lifecycle.
 services:
   - name: mongo
+    kind: mongo
     depends_on: [timesync]
+    mongo:
+      replica_set: rs0
+      members: [node-1, node-2, node-3]  # eligible nodes (default: all)
+      replicas: 3                        # voting members (default: min(3, members))
+      report_window: 15                  # wait this long for every node before deciding with a majority
+      order_timeout: 120                 # per discovery/wipe/config step
+      allow_force_reconfig: false        # never force-reconfig when a majority is lost
   - name: kafka
     depends_on: [timesync]
   - name: billing

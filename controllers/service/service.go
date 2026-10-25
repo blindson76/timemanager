@@ -15,8 +15,6 @@
 package service
 
 import (
-	"context"
-	"log"
 	"slices"
 	"time"
 
@@ -66,19 +64,6 @@ func (s Status) Clone() Status {
 	return c
 }
 
-// LogObserver logs state changes of a service, skipping data-only updates
-// such as dependency events.
-type LogObserver struct {
-	gstate.BaseObserver[State, Event, Status]
-	Name string
-}
-
-func (o *LogObserver) OnTransition(_ context.Context, e *gstate.TransitionEvent[State, Event, Status]) {
-	if e.To != "" {
-		log.Printf("[%s] %s --%s--> %s", o.Name, e.From, e.Event, e.To)
-	}
-}
-
 // Spec configures one service controller.
 type Spec struct {
 	Name         string
@@ -87,8 +72,10 @@ type Spec struct {
 	RetryDelay   time.Duration
 }
 
-// New builds the controller for spec, with optional observers on its actor.
+// New builds the controller for spec. It logs its transitions; extra
+// observers may be added.
 func New(spec Spec, observers ...gstate.Observer[State, Event, Status]) *executor.Ctrl[State, Event, Status] {
+	observers = append([]gstate.Observer[State, Event, Status]{&executor.TransitionLogger[State, Event, Status]{Name: spec.Name}}, observers...)
 	depsReady := func(s Status) bool {
 		for _, dep := range spec.DependsOn {
 			if s.Deps[dep] != executor.HealthReady {

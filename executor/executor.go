@@ -250,6 +250,18 @@ func (x *Executor) States(controller string) []string {
 	return c.states()
 }
 
+// Data returns a copy of a controller's data, or nil if there is no such
+// controller.
+func (x *Executor) Data(controller string) any {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	c, ok := x.byName[controller]
+	if !ok {
+		return nil
+	}
+	return c.data()
+}
+
 // Stop stops every controller's actor.
 func (x *Executor) Stop() {
 	x.mu.Lock()

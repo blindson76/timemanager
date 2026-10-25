@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"example.com/mystate/controllers/mongo"
 	"example.com/mystate/controllers/service"
 	"example.com/mystate/executor"
 	timesm "example.com/mystate/time"
@@ -61,6 +62,16 @@ func serveClusterService(addr string, r *raft.Raft, fsm *executor.Executor, node
 	mux.HandleFunc("GET /controllers", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(fsm.Controllers())
+	})
+
+	mux.HandleFunc("GET /controllers/{name}", func(w http.ResponseWriter, req *http.Request) {
+		data := fsm.Data(req.PathValue("name"))
+		if data == nil {
+			http.NotFound(w, req)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(data)
 	})
 
 	mux.HandleFunc("/join", func(w http.ResponseWriter, req *http.Request) {
@@ -202,8 +213,12 @@ func main() {
 			WithHealth(timesm.Health).
 			WithActorOptions(timeMachine.WithObservers(&timesm.LogObserver{})),
 	}
-	for _, spec := range config.Services {
-		ctrls = append(ctrls, service.New(spec, &service.LogObserver{Name: spec.Name}))
+	for _, def := range config.Services {
+		if def.Mongo != nil {
+			ctrls = append(ctrls, mongo.New(*def.Mongo))
+		} else {
+			ctrls = append(ctrls, service.New(*def.Service))
+		}
 	}
 	fsm, err := executor.New(ctrls...)
 	if err != nil {
